@@ -13,6 +13,7 @@ Parts Catalog Tool — PyQt5 (Dark-only, Deeper Editor)
 
 import sys
 import shutil
+import os
 import datetime
 import json
 import re
@@ -348,6 +349,17 @@ class CatalogWindow(QMainWindow):
         self.act_save.triggered.connect(self.save_from_form)
         tb.addAction(self.act_save)
 
+        # NEW: Export / Import buttons
+        act_export = QAction("📤 Export Catalog", self)
+        act_export.setToolTip("Export all folders, folder metadata, and entries to a single Markdown file")
+        act_export.triggered.connect(self.export_catalog)
+        tb.addAction(act_export)
+
+        act_import = QAction("📥 Import Catalog", self)
+        act_import.setToolTip("Import a single Markdown catalog file and (re)create the full tree")
+        act_import.triggered.connect(self.import_catalog)
+        tb.addAction(act_import)
+
         # File system model / proxy
         self.fs_model = QFileSystemModel(self)
         self.fs_model.setReadOnly(False)
@@ -517,6 +529,195 @@ class CatalogWindow(QMainWindow):
         self.apply_dark_styles()
 
         self.show_file_ui(False)
+
+    def import_catalog(self):
+        """Import a single-file Markdown export and (re)create folders, folder JSON, and entries."""
+        # Pick file
+        dlg = QFileDialog(self, "Import Catalog")
+        dlg.setFileMode(QFileDialog.ExistingFile)
+        dlg.setNameFilters(["Markdown (*.md)", "All Files (*)"])
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        self._apply_dark(dlg)
+        if dlg.exec_() != QFileDialog.Accepted:
+            return
+        src_path = Path(dlg.selectedFiles()[0])
+
+        try:
+            text = src_path.read_text(encoding="utf-8")
+        except Exception as e:
+            self.error("Import Catalog", f"Failed to read file:\n{e}")
+            return
+
+        # Ask where to import (default to current catalog_root)
+        target = self.catalog_root
+        if not self.ask_yes_no("Import Target", f"Import into this folder?\n{target}\n\nChoose 'No' to pick a different folder."):
+            picked = self.select_directory("Select Import Target Folder")
+            if not picked:
+                return
+            target = picked
+
+        # Overwrite policy
+        overwrite_all = self.ask_yes_no("Overwrite Policy", "If files/folders already exist, overwrite them?")
+        # Parse by streaming through lines
+        lines = text.splitlines()
+        i = 0
+        n = len(lines)
+        current_rel = None
+        errors = []
+
+        def ensure_dir(rel_path: str) -> Path:
+            p = target / ("" if rel_path == "." else rel_path)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+
+        while i < n:
+            ln = lines[i].strip()
+            # Detect section header
+            if ln.startswith("## Folder:"):
+                current_rel = ln.split(":", 1)[1].strip()
+                ensure_dir(current_rel)
+                i += 1
+                continue
+
+            # Detect fenced blocks only when inside a folder
+            if current_rel:
+                # ```json meta
+                if ln == "```json meta":
+                    block = []
+                    i += 1
+                    while i < n and lines[i].strip() != "```":
+                        block.append(lines[i])
+                        i += 1
+                    # consume closing fence
+                    if i < n and lines[i].strip() == "```":
+                        i += 1
+                    # Write folder meta
+                    folder_p = ensure_dir(current_rel)
+                    meta_p = folder_meta_path(folder_p)
+                    try:
+                        meta = json.loads("\n".join(block))
+                    except Exception:
+                        meta = {"TITLE": "", "DESCRIPTION": "", "Summary": "", "Owner": "", "Tags": [], "Created": today_iso(), "Last Updated": today_iso()}
+                    # normalize types
+                    if isinstance(meta.get("Tags"), str):
+                        meta["Tags"] = [t.strip() for t in meta["Tags"].split(",") if t.strip()]
+                    try:
+                        if meta_p.exists() and not overwrite_all:
+                            pass
+                        else:
+                            meta_p.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                    except Exception as e:
+                        errors.append(f"{meta_p}: {e}")
+                    continue
+
+                # ```markdown entry="name.md"
+                if ln.startswith("```markdown"):
+                    # parse entry name
+                    entry_name = None
+                    # simple parse of attribute entry="..."
+                    m = re.search(r'entry\s*=\s*"([^"]+)"', ln)
+                    if m:
+                        entry_name = m.group(1)
+                    block = []
+                    i += 1
+                    while i < n and lines[i].strip() != "```":
+                        block.append(lines[i])
+                        i += 1
+                    if i < n and lines[i].strip() == "```":
+                        i += 1
+                    if entry_name:
+                        folder_p = ensure_dir(current_rel)
+                        file_p = folder_p / entry_name
+                        try:
+                            if file_p.exists() and not overwrite_all:
+                                pass
+                            else:
+                                file_p.write_text("\n".join(block), encoding="utf-8")
+                        except Exception as e:
+                            errors.append(f"{file_p}: {e}")
+                    continue
+
+            i += 1
+
+        # Refresh view
+        self.fs_model.refresh(self.fs_model.index(str(self.catalog_root)))
+        if errors:
+            self.warn("Import Catalog", "Import completed with some errors:\n" + "\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
+        else:
+            self.info("Import Catalog", "Import completed successfully.")
+
+    def export_catalog(self):
+        """Export the entire catalog tree to a single Markdown that can be fully re-imported."""
+        root = self.catalog_root.resolve()
+        # Pick save location
+        dlg = QFileDialog(self, "Save Catalog Export")
+        dlg.setAcceptMode(QFileDialog.AcceptSave)
+        dlg.setNameFilters(["Markdown (*.md)"])
+        dlg.selectFile(f"catalog_export_{now_stamp()}.md")
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        self._apply_dark(dlg)
+        if dlg.exec_() != QFileDialog.Accepted:
+            return
+        out_path = Path(dlg.selectedFiles()[0])
+        if out_path.suffix.lower() != ".md":
+            out_path = out_path.with_suffix(".md")
+
+        lines = []
+        lines.append("# Parts Catalog Export")
+        lines.append("Version: 1")
+        lines.append(f"Exported: {datetime.datetime.now().isoformat(timespec='seconds')}")
+        lines.append("Root: .")
+        lines.append("")
+
+        # Walk folders in sorted order for deterministic output
+        for folder, dirnames, filenames in os.walk(root):
+            folder_p = Path(folder)
+            rel = "." if folder_p == root else str(folder_p.relative_to(root)).replace("\\", "/")
+
+            # Section header
+            lines.append(f"## Folder: {rel}")
+            lines.append("")
+
+            # Folder meta (always include)
+            meta_p = folder_meta_path(folder_p)
+            if meta_p.exists():
+                try:
+                    meta = json.loads(meta_p.read_text(encoding="utf-8"))
+                except Exception:
+                    meta = {"TITLE": "", "DESCRIPTION": "", "Summary": "", "Owner": "", "Tags": [], "Created": today_iso(), "Last Updated": today_iso()}
+            else:
+                meta = {"TITLE": "", "DESCRIPTION": "", "Summary": "", "Owner": "", "Tags": [], "Created": today_iso(), "Last Updated": today_iso()}
+
+            lines.append("```json meta")
+            try:
+                lines.append(json.dumps(meta, indent=2))
+            except Exception:
+                # last-resort: write as raw text if JSON encoding fails
+                lines.append(json.dumps({"_error": "could not encode meta as json"}, indent=2))
+            lines.append("```")
+            lines.append("")
+
+            # Entries: include only .md files in this folder (sorted)
+            for name in sorted(fn for fn in filenames if fn.lower().endswith(".md")):
+                fpath = folder_p / name
+                try:
+                    content = fpath.read_text(encoding="utf-8")
+                except Exception as e:
+                    content = f"<!-- ERROR READING FILE: {e} -->\n"
+                safe_name = name.replace('"', '\\"')
+                lines.append(f"```markdown entry=\"{safe_name}\"")
+                lines.append(content.rstrip("\n"))
+                lines.append("```")
+                lines.append("")
+
+        # Write out
+        try:
+            out_path.write_text("\n".join(lines), encoding="utf-8")
+        except Exception as e:
+            self.error("Export Catalog", f"Failed to write export file:\n{e}")
+            return
+
+        self.info("Export Catalog", f"Exported to:\n{out_path}")
 
     def on_fs_file_renamed(self, dir_path_str: str, old_name: str, new_name: str):
         """When a file/folder is renamed inline in the tree, fix folder JSON and update selection labels."""
