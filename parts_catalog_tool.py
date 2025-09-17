@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 """
-Parts Catalog Tool — PyQt5 (Dark-only, Deeper Editor)
-- One Save (toolbar + Ctrl+S) for both Files and Folders
-- Editor tabs: Metadata, Used On, Netlist, Partlist, Pin Interface, Tests
+Parts Catalog Tool — PyQt5 (Dark-only, Focused Editor v6)
+- Single Save (toolbar + Ctrl+S) for files & folders
+- Metadata tab has subtabs:
+    • Introduction (Title, Part Number, Notes, etc.)
+    • Revision History (global table)
+    • Variant Details (list of items)
+- Editor tabs: Metadata, Netlist (free text), Partlist (free text),
+               Circuit Description (free text), Circuit Theory (free text),
+               Design Analysis (free text), Review (raw Markdown)
+- Autosave + dirty indicator: autosave every N seconds and when switching selection; "●" on active tab + "•" in window title when unsaved
+- Global Find:
+    • Ctrl+F / F3 / Shift+F3 within active editor
+    • Ctrl+Shift+F to search across the catalog and jump to matches
 - Folder metadata panel fills the right pane when a folder is selected
 - Drag & Drop tree with MOVE support (files and folders), resizable splitter
-- Tree shows Name + Description (for files: Title field from Markdown; for folders: TITLE from folder JSON)
+- Tree shows Name + Description (files: Title field from Markdown; folders: TITLE from folder JSON)
 - Folder metadata JSON (<Folder>/<Folder>.json) with fields: TITLE, DESCRIPTION (UPPERCASE), Summary, Owner, Tags, Created, Last Updated
-- Archive: zips the folder containing this script; archive created in temp, then moved INSIDE that folder as YYYYMMDD_HHMMSS.zip
+- Archive: zips folder containing this script; archive saved inside as YYYYMMDD_HHMMSS.zip
 - App/window icon uses an emoji (🗂️)
 """
 
@@ -22,30 +32,40 @@ import subprocess
 import platform
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QSortFilterProxyModel, QModelIndex
-from PyQt5.QtGui import QKeySequence, QIcon, QPixmap, QPainter, QFont
+from PyQt5.QtCore import Qt, QSortFilterProxyModel, QModelIndex, QTimer
+from PyQt5.QtGui import QKeySequence, QIcon, QPixmap, QPainter, QFont, QTextDocument
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFileSystemModel, QTreeView, QToolBar, QAction, QFileDialog,
-    QInputDialog, QMessageBox, QLabel, QAbstractItemView, QFormLayout,
-    QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
-    QGroupBox, QSpacerItem, QSizePolicy, QSplitter, QTabWidget, QTextEdit,
-    QStyleFactory, QStyledItemDelegate
+    QInputDialog, QMessageBox, QLabel, QAbstractItemView,
+    QLineEdit, QHeaderView, QPushButton, QSpacerItem, QSizePolicy,
+    QGroupBox, QSplitter, QTabWidget, QTextEdit, QTableWidget, QTableWidgetItem,
+    QStyleFactory, QStyledItemDelegate, QFormLayout
 )
 
 APP_TITLE = "Parts Catalog Tool"
 DEFAULT_CATALOG_DIR = Path.cwd() / "catalog"
 
+# Metadata fields (Interface -> Notes)
 FIELD_ORDER = [
     ("Title", "Click or tap here to enter text."),
     ("Part Number", "PN-XXX"),
-    ("Revision", "A1-00"),
-    ("Interface", "I2C / SPI / UART / Analog / Digital"),
+    ("Notes", "General notes / interfaces / context"),
     ("Type of Design", "Specialized / Fundamental"),
     ("Level of Novelty", "Inventive / Common"),
     ("Performance Feedback", "Exists / Does Not Exist"),
     ("Verified Performance", "Yes / No"),
 ]
+
+REV_HEADERS = ["Rev", "Date", "Description", "By"]
+PARTLIST_HEADERS = ["Ref Des", "Type", "Value/Description"]
+VARIANT_HEADERS = ["Item"]
+
+SECTION_TITLES = {
+    "cd": "Circuit Description",
+    "ct": "Circuit Theory",
+    "da": "Design Analysis",
+}
 
 # --- Helpers / constants ------------------------------------------------------
 
@@ -60,37 +80,49 @@ def folder_meta_path(folder: Path) -> Path:
 
 MD_ROW_RE = re.compile(r'^\|\s*(?P<field>[^|]+?)\s*\|\s*(?P<value>[^|]*?)\s*\|$')
 
-# === Updated headers per your spec ===========================================
-PARTLIST_HEADERS = ["Ref Des", "Type", "Value/Description"]
-PIN_HEADERS = ["Pin", "Name", "Description", "Note"]
-TEST_HEADERS = ["Test No.", "Name", "Description", "Note"]
-
-# --- New-entry template with updated tables -----------------------------------
-
 def _divider_for(headers):
-    # Divider row matching header text length for nice alignment
     return "| " + " | ".join("-" * len(h) for h in headers) + " |"
+
+# Recognize markdown table divider cells like ---  :---  ---:
+DIVIDER_CELL_RE = re.compile(r'^:?-{2,}:?$')
+
+def _is_md_divider_line(line: str) -> bool:
+    s = line.strip()
+    if not (s.startswith("|") and s.endswith("|")):
+        return False
+    cells = [c.strip() for c in s.strip().strip("|").split("|")]
+    if not cells:
+        return False
+    return all(DIVIDER_CELL_RE.fullmatch(c) for c in cells)
+
+def _is_divider_cells(cells: list) -> bool:
+    return bool(cells) and all(DIVIDER_CELL_RE.fullmatch((c or "").strip()) for c in cells)
 
 NEW_ENTRY_TEMPLATE = f"""# Circuit Metadata
 
 **Last Updated:** {today_iso()}
 
+## Introduction
+
 | Field                  | Value                     |
 | ---------------------- | ------------------------- |
 | Title                  | Click or tap here to enter text. |
 | Part Number            | PN-XXX                    |
-| Revision               | A1-00                     |
-| Interface              | I2C / SPI / UART / Analog / Digital |
+| Notes                  | General notes / interfaces / context |
 | Type of Design         | Specialized / Fundamental |
 | Level of Novelty       | Inventive / Common        |
 | Performance Feedback   | Exists / Does Not Exist   |
 | Verified Performance   | Yes / No                  |
 
-## Used On
+## Revision History
 
-| PN         | Occurrences |
-| ---------- | ----------- |
-| (None)     | 0           |
+| {' | '.join(REV_HEADERS)} |
+{_divider_for(REV_HEADERS)}
+| - | {today_iso()} | initial release |  |
+
+## Variant Details
+
+- (none)
 
 ## Netlist
 
@@ -101,21 +133,22 @@ NEW_ENTRY_TEMPLATE = f"""# Circuit Metadata
 | {" | ".join(PARTLIST_HEADERS)} |
 {_divider_for(PARTLIST_HEADERS)}
 
-## Pin Interface
+## {SECTION_TITLES['cd']}
 
-| {" | ".join(PIN_HEADERS)} |
-{_divider_for(PIN_HEADERS)}
+(brief textual description of the circuit, blocks, signals, constraints…)
 
-## Tests
+## {SECTION_TITLES['ct']}
 
-| {" | ".join(TEST_HEADERS)} |
-{_divider_for(TEST_HEADERS)}
+(theory of operation, formulas, transfer functions, stability, noise…)
+
+## {SECTION_TITLES['da']}
+
+(design tradeoffs, margins, component selection rationale, SOA, derating…)
 """.strip() + "\n"
 
 # --- Render an emoji into a QIcon --------------------------------------------
 
 def make_emoji_icon(emoji: str, px: int = 256) -> QIcon:
-    """Render an emoji to a square pixmap and return as QIcon."""
     pm = QPixmap(px, px)
     pm.fill(Qt.transparent)
     painter = QPainter(pm)
@@ -152,7 +185,6 @@ class DescProxyModel(QSortFilterProxyModel):
         return name.lower().endswith(".md")
 
     def flags(self, index):
-        """Allow dragging everywhere; allow dropping only onto directories."""
         base = super().flags(index)
         if not index.isValid():
             return Qt.ItemIsDropEnabled
@@ -255,7 +287,6 @@ if platform.system() == "Windows":
     from ctypes import wintypes
 
     def _set_win_dark_titlebar(hwnd: int, enabled: bool = True):
-        """Toggle Windows' immersive dark mode on a top-level window (Win10 1809+)."""
         try:
             DWMWA_USE_IMMERSIVE_DARK_MODE = 20
             DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19
@@ -292,10 +323,9 @@ else:
 # --- Custom delegate to make inline editor slim/legible -----------------------
 
 class SlimLineEditDelegate(QStyledItemDelegate):
-    """Ensures the inline editor in the tree has a thin border and proper padding."""
     def createEditor(self, parent, option, index):
         editor = QLineEdit(parent)
-        editor.setFrame(False)  # remove thick native frame
+        editor.setFrame(False)
         editor.setStyleSheet(
             "QLineEdit {"
             "  background-color: #2A2D31;"
@@ -314,11 +344,18 @@ class CatalogWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(app_icon)
-        self.resize(1280, 860)
+        self.resize(1280, 900)
 
         self.catalog_root = catalog_root
-        self.current_path: Path | None = None  # file path when editing file
-        self.current_folder: Path | None = None  # folder when editing folder meta
+        self.current_path: Path | None = None
+        self.current_folder: Path | None = None
+
+        # Dirty / autosave
+        self.dirty = False
+        self.suppress_dirty = False
+        self.review_dirty = False
+        self.autosave_interval_ms = 30000  # 30s
+        self.base_tab_titles = []  # will be set after tabs are built
 
         # Toolbar
         tb = QToolBar("Main", self)
@@ -349,16 +386,16 @@ class CatalogWindow(QMainWindow):
         self.act_save.triggered.connect(self.save_from_form)
         tb.addAction(self.act_save)
 
-        # NEW: Export / Import buttons
-        act_export = QAction("📤 Export Catalog", self)
-        act_export.setToolTip("Export all folders, folder metadata, and entries to a single Markdown file")
-        act_export.triggered.connect(self.export_catalog)
-        tb.addAction(act_export)
+        # Find actions (global + in-tab)
+        act_find = QAction("🔍 Find", self);           act_find.setShortcut("Ctrl+F");        act_find.triggered.connect(self.find_in_active)
+        act_find_next = QAction("Find Next", self);    act_find_next.setShortcut("F3");       act_find_next.triggered.connect(self.find_next)
+        act_find_prev = QAction("Find Prev", self);    act_find_prev.setShortcut("Shift+F3"); act_find_prev.triggered.connect(self.find_prev)
+        act_find_catalog = QAction("🗂️ Search Catalog…", self); act_find_catalog.setShortcut("Ctrl+Shift+F"); act_find_catalog.triggered.connect(self.search_catalog)
+        tb.addAction(act_find); tb.addAction(act_find_next); tb.addAction(act_find_prev); tb.addAction(act_find_catalog)
 
-        act_import = QAction("📥 Import Catalog", self)
-        act_import.setToolTip("Import a single Markdown catalog file and (re)create the full tree")
-        act_import.triggered.connect(self.import_catalog)
-        tb.addAction(act_import)
+        # Export / Import
+        act_export = QAction("📤 Export Catalog", self); act_export.triggered.connect(self.export_catalog); tb.addAction(act_export)
+        act_import = QAction("📥 Import Catalog", self); act_import.triggered.connect(self.import_catalog); tb.addAction(act_import)
 
         # File system model / proxy
         self.fs_model = QFileSystemModel(self)
@@ -366,8 +403,6 @@ class CatalogWindow(QMainWindow):
         self.fs_model.setRootPath(str(self.catalog_root))
         self.fs_model.setNameFilters(["*.md"])
         self.fs_model.setNameFilterDisables(False)
-
-        # 🔧 handle in-place renames (double-click) so we can fix folder JSON
         self.fs_model.fileRenamed.connect(self.on_fs_file_renamed)
 
         self.proxy = DescProxyModel(self)
@@ -376,7 +411,7 @@ class CatalogWindow(QMainWindow):
         # Left: Tree
         self.tree = QTreeView(self)
         self.tree.setModel(self.proxy)
-        self.tree.setItemDelegate(SlimLineEditDelegate(self.tree))  # slim inline editor
+        self.tree.setItemDelegate(SlimLineEditDelegate(self.tree))
         self.tree.setRootIndex(self.proxy.mapFromSource(self.fs_model.index(str(self.catalog_root))))
         self.tree.setHeaderHidden(False)
         self.tree.setSortingEnabled(True)
@@ -403,10 +438,9 @@ class CatalogWindow(QMainWindow):
         self.path_label = QLabel("", self)
         right_layout.addWidget(self.path_label)
 
-        # Folder metadata panel (fills remaining space)
+        # Folder metadata panel
         self.folder_panel = QGroupBox("Folder Metadata", self)
         fp_layout = QFormLayout(self.folder_panel)
-        # Fields for folder metadata
         self.folder_title = QLineEdit(self.folder_panel); self.folder_title.setPlaceholderText("TITLE (UPPERCASE)")
         self.folder_desc  = QLineEdit(self.folder_panel); self.folder_desc.setPlaceholderText("DESCRIPTION (UPPERCASE)")
         self.folder_summary = QTextEdit(self.folder_panel); self.folder_summary.setPlaceholderText("Summary / notes for this folder…")
@@ -414,7 +448,6 @@ class CatalogWindow(QMainWindow):
         self.folder_tags  = QLineEdit(self.folder_panel); self.folder_tags.setPlaceholderText("Comma-separated tags (e.g., power, digital, hv)")
         self.folder_created = QLineEdit(self.folder_panel); self.folder_created.setReadOnly(True)
         self.folder_updated = QLineEdit(self.folder_panel); self.folder_updated.setReadOnly(True)
-
         fp_layout.addRow("TITLE:", self.folder_title)
         fp_layout.addRow("DESCRIPTION:", self.folder_desc)
         fp_layout.addRow("Summary:", self.folder_summary)
@@ -422,117 +455,134 @@ class CatalogWindow(QMainWindow):
         fp_layout.addRow("Tags:", self.folder_tags)
         fp_layout.addRow("Created:", self.folder_created)
         fp_layout.addRow("Last Updated:", self.folder_updated)
-
         right_layout.addWidget(self.folder_panel, 1)
 
         # Editor tabs
         self.tabs = QTabWidget(self)
 
-        # Metadata tab
+        # -------- Metadata tab with subtabs: Introduction / Revision History / Variant Details
         meta_tab = QWidget(self); meta_v = QVBoxLayout(meta_tab); meta_v.setContentsMargins(0,0,0,0); meta_v.setSpacing(8)
-        self.fields_group = QGroupBox("Circuit Metadata", meta_tab)
+
+        self.meta_inner = QTabWidget(meta_tab)
+
+        # Introduction
+        intro_tab = QWidget(self); intro_v = QVBoxLayout(intro_tab); intro_v.setContentsMargins(0,0,0,0)
+        self.fields_group = QGroupBox("Introduction", intro_tab)
         self.fields_form = QFormLayout(self.fields_group)
         self.field_widgets: dict[str, QLineEdit] = {}
         for label, placeholder in FIELD_ORDER:
             le = QLineEdit(self.fields_group); le.setPlaceholderText(placeholder)
             self.field_widgets[label] = le
             self.fields_form.addRow(label + ":", le)
-        meta_v.addWidget(self.fields_group)
+        intro_v.addWidget(self.fields_group)
+        self.meta_inner.addTab(intro_tab, "Introduction")
+
+        # Revision History
+        rev_tab = QWidget(self); rev_v = QVBoxLayout(rev_tab)
+        self.rev_table = QTableWidget(0, len(REV_HEADERS), rev_tab)
+        self.rev_table.setHorizontalHeaderLabels(REV_HEADERS)
+        for c, h in enumerate(REV_HEADERS):
+            mode = QHeaderView.Stretch if h == "Description" else QHeaderView.ResizeToContents
+            self.rev_table.horizontalHeader().setSectionResizeMode(c, mode)
+        self.rev_table.verticalHeader().setVisible(False)
+        rev_buttons = QHBoxLayout()
+        self.btn_rev_add = QPushButton("Add Row"); self.btn_rev_del = QPushButton("Remove Selected")
+        self.btn_rev_add.clicked.connect(self.add_rev_row)
+        self.btn_rev_del.clicked.connect(self.remove_rev_row)
+        rev_buttons.addWidget(self.btn_rev_add); rev_buttons.addWidget(self.btn_rev_del)
+        rev_buttons.addItem(QSpacerItem(40,20,QSizePolicy.Expanding,QSizePolicy.Minimum))
+        rev_v.addWidget(self.rev_table)
+        rev_v.addLayout(rev_buttons)
+        self.meta_inner.addTab(rev_tab, "Revision History")
+
+        # Variant Details (list)
+        var_tab = QWidget(self); var_v = QVBoxLayout(var_tab)
+        self.variant_table = QTableWidget(0, 1, var_tab)
+        self.variant_table.setHorizontalHeaderLabels(VARIANT_HEADERS)
+        self.variant_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.variant_table.verticalHeader().setVisible(False)
+        var_buttons = QHBoxLayout()
+        self.btn_var_add = QPushButton("Add Item"); self.btn_var_del = QPushButton("Remove Selected")
+        self.btn_var_add.clicked.connect(self.add_variant_row)
+        self.btn_var_del.clicked.connect(self.remove_variant_row)
+        var_buttons.addWidget(self.btn_var_add); var_buttons.addWidget(self.btn_var_del)
+        var_buttons.addItem(QSpacerItem(40,20,QSizePolicy.Expanding,QSizePolicy.Minimum))
+        var_v.addWidget(self.variant_table)
+        var_v.addLayout(var_buttons)
+        self.meta_inner.addTab(var_tab, "Variant Details")
+
+        meta_v.addWidget(self.meta_inner)
         self.tabs.addTab(meta_tab, "Metadata")
 
-        # Used On tab
-        used_tab = QWidget(self); used_v = QVBoxLayout(used_tab)
-        self.used_table = QTableWidget(0, 2, used_tab)
-        self.used_table.setHorizontalHeaderLabels(["PN", "Occurrences"])
-        self.used_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.used_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.used_table.verticalHeader().setVisible(False)
-        used_v.addWidget(self.used_table)
-        used_btns = QHBoxLayout(); self.btn_add_row = QPushButton("Add Row"); self.btn_del_row = QPushButton("Remove Selected")
-        self.btn_add_row.clicked.connect(self.add_used_row); self.btn_del_row.clicked.connect(self.remove_used_row)
-        used_btns.addWidget(self.btn_add_row); used_btns.addWidget(self.btn_del_row); used_btns.addItem(QSpacerItem(40,20,QSizePolicy.Expanding,QSizePolicy.Minimum))
-        used_v.addLayout(used_btns)
-        self.tabs.addTab(used_tab, "Used On")
-
-        # Netlist tab
+        # Netlist (free text)
         net_tab = QWidget(self); net_v = QVBoxLayout(net_tab)
         self.netlist_edit = QTextEdit(net_tab)
         self.netlist_edit.setPlaceholderText("(paste or type your netlist here)")
         net_v.addWidget(self.netlist_edit)
         self.tabs.addTab(net_tab, "Netlist")
 
-        # Partlist tab (UPDATED HEADERS)
+        # Partlist (free text)
         pl_tab = QWidget(self); pl_v = QVBoxLayout(pl_tab)
-        self.part_table = QTableWidget(0, len(PARTLIST_HEADERS), pl_tab)
-        self.part_table.setHorizontalHeaderLabels(PARTLIST_HEADERS)
-        # reasonable sizing
-        self.part_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Ref Des
-        self.part_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Type
-        self.part_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)           # Value/Description
-        self.part_table.verticalHeader().setVisible(False)
-        pl_v.addWidget(self.part_table)
-        pl_btns = QHBoxLayout()
-        self.btn_pl_add = QPushButton("Add Row"); self.btn_pl_del = QPushButton("Remove Selected")
-        self.btn_pl_add.clicked.connect(lambda: self.add_row(self.part_table, default=["", "", ""]))
-        self.btn_pl_del.clicked.connect(lambda: self.remove_selected_row(self.part_table))
-        pl_btns.addWidget(self.btn_pl_add); pl_btns.addWidget(self.btn_pl_del); pl_btns.addItem(QSpacerItem(40,20,QSizePolicy.Expanding,QSizePolicy.Minimum))
-        pl_v.addLayout(pl_btns)
+        self.partlist_edit = QTextEdit(pl_tab)
+        self.partlist_edit.setPlaceholderText(
+            "(paste or type your partlist table here)\n"
+            f"| {' | '.join(PARTLIST_HEADERS)} |\n{_divider_for(PARTLIST_HEADERS)}"
+        )
+        pl_v.addWidget(self.partlist_edit)
         self.tabs.addTab(pl_tab, "Partlist")
 
-        # Pin Interface tab (UPDATED HEADERS)
-        pin_tab = QWidget(self); pin_v = QVBoxLayout(pin_tab)
-        self.pin_table = QTableWidget(0, len(PIN_HEADERS), pin_tab)
-        self.pin_table.setHorizontalHeaderLabels(PIN_HEADERS)
-        for c in range(len(PIN_HEADERS)):
-            # Let Description stretch
-            mode = QHeaderView.Stretch if PIN_HEADERS[c] == "Description" else QHeaderView.ResizeToContents
-            self.pin_table.horizontalHeader().setSectionResizeMode(c, mode)
-        self.pin_table.verticalHeader().setVisible(False)
-        pin_v.addWidget(self.pin_table)
-        pin_btns = QHBoxLayout()
-        self.btn_pin_add = QPushButton("Add Row"); self.btn_pin_del = QPushButton("Remove Selected")
-        self.btn_pin_add.clicked.connect(lambda: self.add_row(self.pin_table, default=["", "", "", ""]))
-        self.btn_pin_del.clicked.connect(lambda: self.remove_selected_row(self.pin_table))
-        pin_btns.addWidget(self.btn_pin_add); pin_btns.addWidget(self.btn_pin_del); pin_btns.addItem(QSpacerItem(40,20,QSizePolicy.Expanding,QSizePolicy.Minimum))
-        pin_v.addLayout(pin_btns)
-        self.tabs.addTab(pin_tab, "Pin Interface")
+        # Circuit Description / Theory / Design Analysis (each simple text editor)
+        self.cd_edit = QTextEdit(self); self.cd_edit.setPlaceholderText("(Click or type to add content…)")
+        cd_tab = QWidget(self); cd_v = QVBoxLayout(cd_tab); cd_v.addWidget(self.cd_edit)
+        self.tabs.addTab(cd_tab, SECTION_TITLES["cd"])
 
-        # Tests tab (UPDATED HEADERS)
-        test_tab = QWidget(self); test_v = QVBoxLayout(test_tab)
-        self.test_table = QTableWidget(0, len(TEST_HEADERS), test_tab)
-        self.test_table.setHorizontalHeaderLabels(TEST_HEADERS)
-        for c in range(len(TEST_HEADERS)):
-            mode = QHeaderView.Stretch if TEST_HEADERS[c] in ("Description", "Note") else QHeaderView.ResizeToContents
-            self.test_table.horizontalHeader().setSectionResizeMode(c, mode)
-        self.test_table.verticalHeader().setVisible(False)
-        test_v.addWidget(self.test_table)
-        test_btns = QHBoxLayout()
-        self.btn_test_add = QPushButton("Add Row"); self.btn_test_del = QPushButton("Remove Selected")
-        self.btn_test_add.clicked.connect(lambda: self.add_row(self.test_table, default=["", "", "", ""]))
-        self.btn_test_del.clicked.connect(lambda: self.remove_selected_row(self.test_table))
-        test_btns.addWidget(self.btn_test_add); test_btns.addWidget(self.btn_test_del); test_btns.addItem(QSpacerItem(40,20,QSizePolicy.Expanding,QSizePolicy.Minimum))
-        test_v.addLayout(test_btns)
-        self.tabs.addTab(test_tab, "Tests")
+        self.ct_edit = QTextEdit(self); self.ct_edit.setPlaceholderText("(Click or type to add content…)")
+        ct_tab = QWidget(self); ct_v = QVBoxLayout(ct_tab); ct_v.addWidget(self.ct_edit)
+        self.tabs.addTab(ct_tab, SECTION_TITLES["ct"])
+
+        self.da_edit = QTextEdit(self); self.da_edit.setPlaceholderText("(Click or type to add content…)")
+        da_tab = QWidget(self); da_v = QVBoxLayout(da_tab); da_v.addWidget(self.da_edit)
+        self.tabs.addTab(da_tab, SECTION_TITLES["da"])
+
+        # Review (raw markdown)
+        review_tab = QWidget(self); review_v = QVBoxLayout(review_tab)
+        self.review_edit = QTextEdit(review_tab)
+        self.review_edit.setPlaceholderText("Raw Markdown view. Edits here will be saved verbatim.")
+        self.review_edit.textChanged.connect(self._on_review_changed)
+        review_v.addWidget(self.review_edit)
+        self.tabs.addTab(review_tab, "Review")
 
         right_layout.addWidget(self.tabs, 1)
+
+        # After building tabs: set base titles, wire dirty + autosave
+        self.base_tab_titles = [self.tabs.tabText(i) for i in range(self.tabs.count())]
+        self.tabs.currentChanged.connect(self.update_dirty_indicator)
+
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.timeout.connect(lambda: self.save_from_form(silent=True))
+        self.autosave_timer.start(self.autosave_interval_ms)
+
+        self._wire_dirty_signals()
 
         # Splitter
         splitter = QSplitter(Qt.Horizontal, self)
         splitter.addWidget(self.tree)
         splitter.addWidget(right_container)
-        splitter.setStretchFactor(0, 1); splitter.setStretchFactor(1, 2); splitter.setSizes([360, 920])
+        splitter.setStretchFactor(0, 1); splitter.setStretchFactor(1, 2); splitter.setSizes([360, 980])
 
         central = QWidget(self); outer = QHBoxLayout(central); outer.setContentsMargins(8,8,8,8); outer.setSpacing(8)
         outer.addWidget(splitter); self.setCentralWidget(central)
 
-        # Apply dark stylesheet
+        # Dark stylesheet
         self.apply_dark_styles()
-
         self.show_file_ui(False)
 
+        # Find state
+        self.last_find = ""
+
+    # ---------- Import / Export -------------------------------------------------
+
     def import_catalog(self):
-        """Import a single-file Markdown export and (re)create folders, folder JSON, and entries."""
-        # Pick file
         dlg = QFileDialog(self, "Import Catalog")
         dlg.setFileMode(QFileDialog.ExistingFile)
         dlg.setNameFilters(["Markdown (*.md)", "All Files (*)"])
@@ -548,7 +598,6 @@ class CatalogWindow(QMainWindow):
             self.error("Import Catalog", f"Failed to read file:\n{e}")
             return
 
-        # Ask where to import (default to current catalog_root)
         target = self.catalog_root
         if not self.ask_yes_no("Import Target", f"Import into this folder?\n{target}\n\nChoose 'No' to pick a different folder."):
             picked = self.select_directory("Select Import Target Folder")
@@ -556,9 +605,7 @@ class CatalogWindow(QMainWindow):
                 return
             target = picked
 
-        # Overwrite policy
         overwrite_all = self.ask_yes_no("Overwrite Policy", "If files/folders already exist, overwrite them?")
-        # Parse by streaming through lines
         lines = text.splitlines()
         i = 0
         n = len(lines)
@@ -572,33 +619,27 @@ class CatalogWindow(QMainWindow):
 
         while i < n:
             ln = lines[i].strip()
-            # Detect section header
             if ln.startswith("## Folder:"):
                 current_rel = ln.split(":", 1)[1].strip()
                 ensure_dir(current_rel)
                 i += 1
                 continue
 
-            # Detect fenced blocks only when inside a folder
             if current_rel:
-                # ```json meta
                 if ln == "```json meta":
                     block = []
                     i += 1
                     while i < n and lines[i].strip() != "```":
                         block.append(lines[i])
                         i += 1
-                    # consume closing fence
                     if i < n and lines[i].strip() == "```":
                         i += 1
-                    # Write folder meta
                     folder_p = ensure_dir(current_rel)
                     meta_p = folder_meta_path(folder_p)
                     try:
                         meta = json.loads("\n".join(block))
                     except Exception:
                         meta = {"TITLE": "", "DESCRIPTION": "", "Summary": "", "Owner": "", "Tags": [], "Created": today_iso(), "Last Updated": today_iso()}
-                    # normalize types
                     if isinstance(meta.get("Tags"), str):
                         meta["Tags"] = [t.strip() for t in meta["Tags"].split(",") if t.strip()]
                     try:
@@ -610,14 +651,9 @@ class CatalogWindow(QMainWindow):
                         errors.append(f"{meta_p}: {e}")
                     continue
 
-                # ```markdown entry="name.md"
                 if ln.startswith("```markdown"):
-                    # parse entry name
-                    entry_name = None
-                    # simple parse of attribute entry="..."
                     m = re.search(r'entry\s*=\s*"([^"]+)"', ln)
-                    if m:
-                        entry_name = m.group(1)
+                    entry_name = m.group(1) if m else None
                     block = []
                     i += 1
                     while i < n and lines[i].strip() != "```":
@@ -639,7 +675,6 @@ class CatalogWindow(QMainWindow):
 
             i += 1
 
-        # Refresh view
         self.fs_model.refresh(self.fs_model.index(str(self.catalog_root)))
         if errors:
             self.warn("Import Catalog", "Import completed with some errors:\n" + "\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
@@ -647,9 +682,7 @@ class CatalogWindow(QMainWindow):
             self.info("Import Catalog", "Import completed successfully.")
 
     def export_catalog(self):
-        """Export the entire catalog tree to a single Markdown that can be fully re-imported."""
         root = self.catalog_root.resolve()
-        # Pick save location
         dlg = QFileDialog(self, "Save Catalog Export")
         dlg.setAcceptMode(QFileDialog.AcceptSave)
         dlg.setNameFilters(["Markdown (*.md)"])
@@ -669,16 +702,13 @@ class CatalogWindow(QMainWindow):
         lines.append("Root: .")
         lines.append("")
 
-        # Walk folders in sorted order for deterministic output
         for folder, dirnames, filenames in os.walk(root):
             folder_p = Path(folder)
             rel = "." if folder_p == root else str(folder_p.relative_to(root)).replace("\\", "/")
 
-            # Section header
             lines.append(f"## Folder: {rel}")
             lines.append("")
 
-            # Folder meta (always include)
             meta_p = folder_meta_path(folder_p)
             if meta_p.exists():
                 try:
@@ -692,12 +722,10 @@ class CatalogWindow(QMainWindow):
             try:
                 lines.append(json.dumps(meta, indent=2))
             except Exception:
-                # last-resort: write as raw text if JSON encoding fails
                 lines.append(json.dumps({"_error": "could not encode meta as json"}, indent=2))
             lines.append("```")
             lines.append("")
 
-            # Entries: include only .md files in this folder (sorted)
             for name in sorted(fn for fn in filenames if fn.lower().endswith(".md")):
                 fpath = folder_p / name
                 try:
@@ -710,7 +738,6 @@ class CatalogWindow(QMainWindow):
                 lines.append("```")
                 lines.append("")
 
-        # Write out
         try:
             out_path.write_text("\n".join(lines), encoding="utf-8")
         except Exception as e:
@@ -719,30 +746,25 @@ class CatalogWindow(QMainWindow):
 
         self.info("Export Catalog", f"Exported to:\n{out_path}")
 
+    # ---------- Tree rename handling -------------------------------------------
+
     def on_fs_file_renamed(self, dir_path_str: str, old_name: str, new_name: str):
-        """When a file/folder is renamed inline in the tree, fix folder JSON and update selection labels."""
         try:
             dir_path = Path(dir_path_str)
             old_path = dir_path / old_name
             new_path = dir_path / new_name
 
             if new_path.is_dir():
-                # Rename or remove the obsolete <old_name>.json inside the renamed folder
                 old_meta = new_path / f"{old_name}.json"
                 new_meta = new_path / f"{new_name}.json"
 
                 if old_meta.exists():
                     if new_meta.exists():
-                        # Correct file already present — old one is obsolete
-                        try:
-                            old_meta.unlink()
-                        except Exception:
-                            pass
+                        try: old_meta.unlink()
+                        except Exception: pass
                     else:
-                        try:
-                            old_meta.rename(new_meta)
+                        try: old_meta.rename(new_meta)
                         except Exception:
-                            # Fallback: copy then delete
                             try:
                                 data = old_meta.read_text(encoding="utf-8")
                                 new_meta.write_text(data, encoding="utf-8")
@@ -750,16 +772,13 @@ class CatalogWindow(QMainWindow):
                             except Exception:
                                 pass
 
-                # Refresh description column for this folder
                 self.proxy.refresh_desc(new_path)
 
-                # If this was the folder we're editing, update references/UI label
                 if self.current_folder and (self.current_folder == old_path or self.current_folder.name == old_name and self.current_folder.parent == dir_path):
                     self.current_folder = new_path
                     self.path_label.setText(f"Folder: {new_path}")
 
             else:
-                # File rename: refresh description if it's a .md
                 if new_path.suffix.lower() == ".md":
                     self.proxy.refresh_desc(new_path)
                 if self.current_path and (self.current_path == old_path or (self.current_path.name == old_name and self.current_path.parent == dir_path)):
@@ -767,9 +786,7 @@ class CatalogWindow(QMainWindow):
                     self.path_label.setText(f"File: {new_path}")
 
         except Exception:
-            # Keep UI responsive even if something odd happens
             pass
-
 
     # --- Styling ----------------------------------------------------------------
     def apply_dark_styles(self):
@@ -785,25 +802,15 @@ class CatalogWindow(QMainWindow):
             QLineEdit, QTextEdit {
                 background-color: #2A2D31; color: #E6E6E6; border: 1px solid #3A3F44; border-radius: 6px; padding: 6px;
             }
-            /* Slim inline editor inside the tree */
             QTreeView QLineEdit {
                 background-color: #2A2D31; color: #E6E6E6; border: 1px solid #3A3F44; padding: 2px 4px;
             }
-            QPushButton {
-                background-color: #2F343A; color: #E6E6E6; border: 1px solid #444; border-radius: 6px; padding: 6px 12px;
-            }
-            QPushButton:hover { background-color: #3A4047; }
-            QPushButton:pressed { background-color: #2A2F35; }
             QTreeView {
                 background-color: #1E2124; alternate-background-color: #24272B; border: 1px solid #3A3F44;
             }
             QTreeView::item:selected { background: #3B4252; color: #E6E6E6; }
             QHeaderView::section {
                 background-color: #2A2D31; color: #E6E6E6; border: 0px; padding: 6px; font-weight: 600;
-            }
-            QTableWidget {
-                background-color: #1E2124; color: #E6E6E6; gridline-color: #3A3F44;
-                alternate-background-color: #24272B; border: 1px solid #3A3F44; border-radius: 6px;
             }
             QTabBar::tab {
                 background: #2A2D31; color: #E6E6E6; padding: 8px 12px; margin-right: 2px;
@@ -812,17 +819,12 @@ class CatalogWindow(QMainWindow):
             QTabBar::tab:selected { background: #3A3F44; }
             QTabBar::tab:hover { background: #34383D; }
 
-            /* Popups (client area) */
-            QMessageBox, QInputDialog, QFileDialog {
-                background-color: #202225; color: #E6E6E6;
-            }
+            QMessageBox, QInputDialog, QFileDialog { background-color: #202225; color: #E6E6E6; }
             QMessageBox QPushButton, QInputDialog QPushButton, QFileDialog QPushButton {
                 background-color: #2F343A; color: #E6E6E6; border: 1px solid #444;
                 border-radius: 6px; padding: 6px 12px;
             }
-            QMessageBox QPushButton:hover, QInputDialog QPushButton:hover, QFileDialog QPushButton:hover {
-                background-color: #3A4047;
-            }
+            QMessageBox QPushButton:hover, QInputDialog QPushButton:hover, QFileDialog QPushButton:hover { background-color: #3A4047; }
         """)
 
     # --- Dialog helpers ---------------------------------------------------------
@@ -831,6 +833,16 @@ class CatalogWindow(QMainWindow):
             apply_windows_dark_titlebar(dlg)
         except Exception:
             pass
+
+    def select_directory(self, title: str) -> Path | None:
+        dlg = QFileDialog(self, title)
+        dlg.setFileMode(QFileDialog.Directory)
+        dlg.setOption(QFileDialog.ShowDirsOnly, True)
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        self._apply_dark(dlg)
+        if dlg.exec_() == QFileDialog.Accepted:
+            return Path(dlg.selectedFiles()[0])
+        return None
 
     def ask_text(self, title: str, label: str, default: str = "") -> tuple[str, bool]:
         dlg = QInputDialog(self)
@@ -864,8 +876,8 @@ class CatalogWindow(QMainWindow):
         mb.setWindowTitle(title)
         mb.setText(text)
         mb.setIcon(QMessageBox.Warning)
-        mb.setStandardButtons(QMessageBox.Ok)
         self._apply_dark(mb)
+        mb.setStandardButtons(QMessageBox.Ok)
         mb.exec_()
 
     def error(self, title: str, text: str):
@@ -877,9 +889,57 @@ class CatalogWindow(QMainWindow):
         self._apply_dark(mb)
         mb.exec_()
 
+    # --- Dirty / autosave helpers ----------------------------------------------
+    def _wire_dirty_signals(self):
+        # Text editors
+        for ed in [self.netlist_edit, self.partlist_edit, self.cd_edit, self.ct_edit, self.da_edit]:
+            ed.textChanged.connect(self._mark_dirty)
+        # Review editor (also has review_dirty flag)
+        self.review_edit.textChanged.connect(self._mark_dirty)
+        # Introduction fields
+        for le in self.field_widgets.values():
+            le.textChanged.connect(self._mark_dirty)
+        # Metadata tables
+        self.rev_table.itemChanged.connect(self._mark_dirty)
+        self.variant_table.itemChanged.connect(self._mark_dirty)
+        # Folder panel fields
+        self.folder_title.textChanged.connect(self._mark_dirty)
+        self.folder_desc.textChanged.connect(self._mark_dirty)
+        self.folder_summary.textChanged.connect(self._mark_dirty)
+        self.folder_owner.textChanged.connect(self._mark_dirty)
+        self.folder_tags.textChanged.connect(self._mark_dirty)
+
+    def _strip_dot(self, s: str) -> str:
+        return s.lstrip("● ").strip()
+
+    def _mark_dirty(self, *args):
+        if self.suppress_dirty:
+            return
+        if not self.dirty:
+            self.dirty = True
+            self.update_dirty_indicator()
+
+    def update_dirty_indicator(self):
+        # Ensure base titles match current tabs
+        if len(self.base_tab_titles) != self.tabs.count():
+            self.base_tab_titles = [self._strip_dot(self.tabs.tabText(i)) for i in range(self.tabs.count())]
+        for i, base in enumerate(self.base_tab_titles):
+            want = ("● " + base) if (self.dirty and i == self.tabs.currentIndex()) else base
+            if self.tabs.tabText(i) != want:
+                self.tabs.setTabText(i, want)
+        self.setWindowTitle(APP_TITLE + (" •" if self.dirty else ""))
+
+    def _clear_dirty(self):
+        if self.dirty:
+            self.dirty = False
+            self.update_dirty_indicator()
+
     # --- UI helpers -------------------------------------------------------------
+    def _on_review_changed(self):
+        self.review_dirty = True
+        self._mark_dirty()
+
     def show_file_ui(self, file_selected: bool):
-        """Toggle between file editor (tabs) and folder metadata panel."""
         self.tabs.setVisible(file_selected)
         self.folder_panel.setVisible(not file_selected)
 
@@ -899,20 +959,37 @@ class CatalogWindow(QMainWindow):
     def is_markdown(self, path: Path) -> bool:
         return path.is_file() and path.suffix.lower() == ".md"
 
-    # --- Table helpers ----------------------------------------------------------
-    def add_row(self, table: QTableWidget, default=None):
-        r = table.rowCount(); table.insertRow(r)
-        cols = table.columnCount()
-        default = default or ["" for _ in range(cols)]
-        for c in range(cols):
-            table.setItem(r, c, QTableWidgetItem(default[c]))
+    # --- Metadata helpers -------------------------------------------------------
+    def add_rev_row(self):
+        r = self.rev_table.rowCount()
+        self.rev_table.insertRow(r)
+        defaults = ["", today_iso(), "", ""]
+        if r == 0:
+            defaults = ["-", today_iso(), "initial release", ""]
+        for c, val in enumerate(defaults):
+            self.rev_table.setItem(r, c, QTableWidgetItem(val))
 
-    def remove_selected_row(self, table: QTableWidget):
-        r = table.currentRow()
-        if r >= 0: table.removeRow(r)
+    def remove_rev_row(self):
+        r = self.rev_table.currentRow()
+        if r >= 0:
+            self.rev_table.removeRow(r)
+
+    def add_variant_row(self):
+        r = self.variant_table.rowCount()
+        self.variant_table.insertRow(r)
+        self.variant_table.setItem(r, 0, QTableWidgetItem(""))
+
+    def remove_variant_row(self):
+        r = self.variant_table.currentRow()
+        if r >= 0:
+            self.variant_table.removeRow(r)
 
     # --- Selection / load -------------------------------------------------------
     def on_tree_selection(self, *_):
+        # Autosave before switching away
+        if self.dirty:
+            self.save_from_form(silent=True)
+
         path = self.selected_path()
         if not path: return
         if path.is_dir():
@@ -928,8 +1005,8 @@ class CatalogWindow(QMainWindow):
             self.show_file_ui(True)
 
     def load_folder_meta(self, folder: Path):
+        self.suppress_dirty = True
         meta = self.read_folder_meta(folder)
-        # Fill fields
         self.folder_title.setText(meta.get("TITLE", ""))
         self.folder_desc.setText(meta.get("DESCRIPTION", ""))
         self.folder_summary.setPlainText(meta.get("Summary", ""))
@@ -940,6 +1017,8 @@ class CatalogWindow(QMainWindow):
         self.folder_tags.setText(tags_val)
         self.folder_created.setText(meta.get("Created", ""))
         self.folder_updated.setText(meta.get("Last Updated", ""))
+        self.suppress_dirty = False
+        self._clear_dirty()
 
     def load_file(self, path: Path):
         try:
@@ -950,52 +1029,125 @@ class CatalogWindow(QMainWindow):
         self.current_path = path
         self.path_label.setText(f"File: {path}")
 
-        fields, used_rows, netlist, part_rows, pin_rows, test_rows = self.parse_markdown(text)
+        (fields, rev_rows, variant_items, netlist, partlist_text,
+         cd, ct, da) = self.parse_markdown(text)
 
-        # Metadata fields
+        self.suppress_dirty = True
+
+        # Intro fields
         for key, _ in FIELD_ORDER:
             self.field_widgets[key].setText(fields.get(key, ""))
 
-        # Used On
-        self.used_table.setRowCount(0)
-        for pn, occ in used_rows:
-            self.add_row(self.used_table, [pn, occ])
+        # Revision table
+        self.rev_table.setRowCount(0)
+        for row in rev_rows:
+            rr = (row + [""] * len(REV_HEADERS))[:len(REV_HEADERS)]
+            r = self.rev_table.rowCount()
+            self.rev_table.insertRow(r)
+            for c, val in enumerate(rr):
+                self.rev_table.setItem(r, c, QTableWidgetItem(val))
 
-        # Netlist
+        # Variant Details
+        self.variant_table.setRowCount(0)
+        for item in variant_items:
+            r = self.variant_table.rowCount()
+            self.variant_table.insertRow(r)
+            self.variant_table.setItem(r, 0, QTableWidgetItem(item))
+
+        # Sections
         self.netlist_edit.setPlainText(netlist)
+        self.partlist_edit.setPlainText(partlist_text)
+        self.cd_edit.setPlainText(cd)
+        self.ct_edit.setPlainText(ct)
+        self.da_edit.setPlainText(da)
 
-        # Partlist
-        self.part_table.setRowCount(0)
-        for row in part_rows:
-            self.add_row(self.part_table, row + [""] * (len(PARTLIST_HEADERS) - len(row)))
+        # Raw review
+        self.review_edit.blockSignals(True)
+        self.review_edit.setPlainText(text)
+        self.review_edit.blockSignals(False)
+        self.review_dirty = False
 
-        # Pin Interface
-        self.pin_table.setRowCount(0)
-        for row in pin_rows:
-            self.add_row(self.pin_table, row + [""] * (len(PIN_HEADERS) - len(row)))
-
-        # Tests
-        self.test_table.setRowCount(0)
-        for row in test_rows:
-            self.add_row(self.test_table, row + [""] * (len(TEST_HEADERS) - len(row)))
+        self.suppress_dirty = False
+        self._clear_dirty()
 
         self.proxy.refresh_desc(path)
 
     # --- Parse / Build markdown -------------------------------------------------
+    def _find_section(self, lines, title: str):
+        want = f"## {title}".lower()
+        for i, ln in enumerate(lines):
+            if ln.strip().lower() == want:
+                return i
+        return None
+
+    def _read_section_text(self, lines, start_idx: int) -> str:
+        j = start_idx + 1
+        out = []
+        n = len(lines)
+        while j < n and not lines[j].startswith("## "):
+            out.append(lines[j])
+            j += 1
+        while out and not out[0].strip(): out.pop(0)
+        while out and not out[-1].strip(): out.pop()
+        return "\n".join(out)
+
+    def _parse_table_at(self, lines, start_idx: int):
+        """Parse a markdown table starting at/after start_idx (skips any divider rows)."""
+        rows = []
+        if start_idx is None:
+            return rows
+        j = start_idx + 1
+        n = len(lines)
+
+        # find header row
+        while j < n and not lines[j].strip().startswith("|"):
+            if lines[j].strip().startswith("## "):
+                return rows
+            j += 1
+        if j >= n:
+            return rows
+
+        # skip one or more divider lines following the header
+        j += 1
+        while j < n and lines[j].strip().startswith("|") and _is_md_divider_line(lines[j]):
+            j += 1
+
+        # consume body (skip any stray divider lines in body)
+        while j < n and lines[j].strip().startswith("|"):
+            if _is_md_divider_line(lines[j]):
+                j += 1
+                continue
+            raw = lines[j].strip().strip("|")
+            cells = [c.strip() for c in raw.split("|")]
+            rows.append(cells)
+            j += 1
+        return rows
+
+    def _parse_bulleted_list(self, lines, start_idx: int):
+        items = []
+        if start_idx is None: return items
+        j = start_idx + 1
+        n = len(lines)
+        while j < n and not lines[j].startswith("## "):
+            s = lines[j].strip()
+            if s.startswith("- "):
+                items.append(s[2:].strip())
+            elif s.startswith("* "):
+                items.append(s[2:].strip())
+            j += 1
+        items = [it for it in items if it.lower() != "(none)"]
+        return items
+
     def parse_markdown(self, text: str):
         lines = [ln.rstrip("\n") for ln in text.splitlines()]
         fields = {k: "" for k, _ in FIELD_ORDER}
-        used_rows, netlist = [], ""
-        part_rows, pin_rows, test_rows = [], [], []
+        rev_rows = []
+        variant_items = []
+        netlist = ""
+        partlist_text = ""
+        cd = ct = da = ""
 
-        def find_section(title: str):
-            header = f"## {title}".lower()
-            for i, ln in enumerate(lines):
-                if ln.strip().lower() == header:
-                    return i
-            return None
-
-        # Metadata table
+        # Introduction table
         i = 0; n = len(lines)
         while i < n:
             if lines[i].strip().lower().startswith("| field") and "| value" in lines[i].lower():
@@ -1010,156 +1162,169 @@ class CatalogWindow(QMainWindow):
                 break
             i += 1
 
-        # Used On (table PN/Occurrences)
-        uix = find_section("Used On")
-        if uix is not None:
-            j = uix + 1
-            while j < n and not lines[j].strip().startswith("|"): j += 1  # header
-            j += 2  # skip header + divider
-            while j < n and lines[j].strip().startswith("|"):
-                m = MD_ROW_RE.match(lines[j].strip())
-                if m:
-                    used_rows.append([m.group("field").strip(), m.group("value").strip()])
-                j += 1
+        # Global Revision History
+        rhx = self._find_section(lines, "Revision History")
+        if rhx is not None:
+            rev_rows = self._parse_table_at(lines, rhx)
 
-        # Netlist (free text until next ## section)
-        nix = find_section("Netlist")
+        # Variant Details
+        vdx = self._find_section(lines, "Variant Details")
+        if vdx is not None:
+            variant_items = self._parse_bulleted_list(lines, vdx)
+
+        # Netlist
+        nix = self._find_section(lines, "Netlist")
         if nix is not None:
-            j = nix + 1
-            chunk = []
-            while j < n and not lines[j].strip().startswith("## "):
-                chunk.append(lines[j])
-                j += 1
-            while chunk and not chunk[0].strip(): chunk.pop(0)
-            while chunk and not chunk[-1].strip(): chunk.pop()
-            netlist = "\n".join(chunk)
+            netlist = self._read_section_text(lines, nix)
 
-        # Generic table parser for Partlist / Pin Interface / Tests
-        def parse_table(at_index: int):
-            rows = []
-            if at_index is None: return rows
-            j = at_index + 1
-            while j < n and not lines[j].strip().startswith("|"): j += 1  # header row
-            j += 1  # divider line
-            while j < n and lines[j].strip().startswith("|"):
-                raw = lines[j].strip().strip("|")
-                cells = [c.strip() for c in raw.split("|")]
-                rows.append(cells)
-                j += 1
-            return rows
+        # Partlist
+        pix = self._find_section(lines, "Partlist")
+        if pix is not None:
+            tmp = self._read_section_text(lines, pix)
+            partlist_text = tmp if tmp.strip() else f"| {' | '.join(PARTLIST_HEADERS)} |\n{_divider_for(PARTLIST_HEADERS)}"
 
-        part_rows = parse_table(find_section("Partlist"))
-        pin_rows  = parse_table(find_section("Pin Interface"))
-        test_rows = parse_table(find_section("Tests"))
+        # Narrative sections
+        cdx = self._find_section(lines, SECTION_TITLES["cd"])
+        if cdx is not None: cd = self._read_section_text(lines, cdx)
+        ctx = self._find_section(lines, SECTION_TITLES["ct"])
+        if ctx is not None: ct = self._read_section_text(lines, ctx)
+        dax = self._find_section(lines, SECTION_TITLES["da"])
+        if dax is not None: da = self._read_section_text(lines, dax)
 
-        return fields, used_rows, netlist, part_rows, pin_rows, test_rows
+        return fields, rev_rows, variant_items, netlist, partlist_text, cd, ct, da
 
-    def build_markdown(self, fields: dict, used_rows: list, netlist: str,
-                       part_rows: list, pin_rows: list, test_rows: list) -> str:
-        # Metadata
-        meta_lines = [
+    def build_markdown(self, fields: dict, rev_rows: list, variant_items: list,
+                       netlist: str, partlist_text: str,
+                       cd: str, ct: str, da: str) -> str:
+        # Introduction table
+        intro_lines = [
             "| Field                  | Value                     |",
             "| ---------------------- | ------------------------- |",
         ]
         for key, _ in FIELD_ORDER:
-            meta_lines.append(f"| {key:<22} | {fields.get(key,'').strip()} |")
+            intro_lines.append(f"| {key:<22} | {fields.get(key,'').strip()} |")
 
-        # Used On
-        used = ["## Used On", "", "| PN         | Occurrences |", "| ---------- | ----------- |"]
-        if used_rows:
-            for pn, occ in used_rows:
-                used.append(f"| {pn or '(None)'} | {occ or '0'} |")
-        else:
-            used.append("| (None)     | 0           |")
-
-        # Netlist
-        net = ["## Netlist", "", netlist.strip() if netlist.strip() else "(paste or type your netlist here)"]
-
-        # Table builder
+        # Build table helper (skip divider-like rows)
         def build_table(headers, rows):
             out = ["| " + " | ".join(headers) + " |",
-                   "| " + " | ".join("-" * len(h) for h in headers) + " |"]
+                   _divider_for(headers)]
             for r in rows:
+                if _is_divider_cells([x.strip() for x in r]):
+                    continue
                 rr = (r + [""] * len(headers))[:len(headers)]
                 out.append("| " + " | ".join(rr) + " |")
-            return out
+            return "\n".join(out)
 
-        part = ["## Partlist", ""]
-        part += build_table(PARTLIST_HEADERS, part_rows)
+        # Variant list to markdown
+        def build_variant_list(items):
+            items = [it.strip() for it in items if it.strip()]
+            if not items:
+                return "- (none)"
+            return "\n".join(f"- {it}" for it in items)
 
-        pin = ["## Pin Interface", ""]
-        pin += build_table(PIN_HEADERS, pin_rows)
+        # Partlist default if empty
+        ptxt = (partlist_text or "").strip()
+        if not ptxt:
+            ptxt = f"| {' | '.join(PARTLIST_HEADERS)} |\n{_divider_for(PARTLIST_HEADERS)}"
 
-        tests = ["## Tests", ""]
-        tests += build_table(TEST_HEADERS, test_rows)
+        def block(h, body):
+            body = (body or "").strip()
+            return [f"## {h}", "", (body if body else "(Click or type to add content…)")]
 
         out = [
             "# Circuit Metadata",
             "",
             f"**Last Updated:** {today_iso()}",
             "",
-            "\n".join(meta_lines),
-            "",
-            "\n".join(used),
-            "",
-            "\n".join(net),
-            "",
-            "\n".join(part),
-            "",
-            "\n".join(pin),
-            "",
-            "\n".join(tests),
-            ""
+            "## Introduction", "",
+            "\n".join(intro_lines), "",
+            "## Revision History", "",
+            build_table(REV_HEADERS, rev_rows), "",
+            "## Variant Details", "",
+            build_variant_list(variant_items), "",
+            *block("Netlist", netlist), "",
+            "## Partlist", "",
+            ptxt, "",
+            *block(SECTION_TITLES["cd"], cd), "",
+            *block(SECTION_TITLES["ct"], ct), "",
+            *block(SECTION_TITLES["da"], da), "",
         ]
-        return "\n".join(out)
+        return "\n".join(out).rstrip() + "\n"
 
     # --- Save -------------------------------------------------------------------
-    def save_from_form(self):
+    def save_from_form(self, silent: bool = False):
         """
         If a file is selected -> save Markdown.
-        If a folder is selected (current_path is None but current_folder set) -> save folder JSON.
+        If a folder is selected -> save folder JSON.
         """
+        # Save file
         if self.current_path and self.is_markdown(self.current_path):
-            # Save file
+            # Review tab takes precedence when dirty or active
+            if self.review_dirty or self._strip_dot(self.tabs.tabText(self.tabs.currentIndex())) == "Review":
+                raw = self.review_edit.toPlainText()
+                try:
+                    self.current_path.write_text(raw, encoding="utf-8")
+                except Exception as e:
+                    self.error("Error", f"Failed to save file:\n{e}"); return
+                if not silent:
+                    self.load_file(self.current_path)  # refresh all views for manual saves
+                self.review_dirty = False
+                self._clear_dirty()
+                if not silent:
+                    self.info("Saved", "Catalog entry saved from raw Markdown.")
+                return
+
+            # Save from structured tabs
             fields = {k: w.text().strip() for k, w in self.field_widgets.items()}
 
-            used_rows = []
-            for r in range(self.used_table.rowCount()):
-                pn = self.used_table.item(r, 0).text().strip() if self.used_table.item(r,0) else ""
-                oc = self.used_table.item(r, 1).text().strip() if self.used_table.item(r,1) else ""
-                used_rows.append([pn, oc])
+            # Revision rows
+            rev_rows = []
+            for r in range(self.rev_table.rowCount()):
+                row = []
+                for c in range(len(REV_HEADERS)):
+                    it = self.rev_table.item(r, c)
+                    row.append(it.text().strip() if it else "")
+                rev_rows.append(row)
+
+            # Variant items
+            variant_items = []
+            for r in range(self.variant_table.rowCount()):
+                it = self.variant_table.item(r, 0)
+                txt = it.text().strip() if it else ""
+                if txt:
+                    variant_items.append(txt)
 
             netlist = self.netlist_edit.toPlainText()
+            partlist_text = self.partlist_edit.toPlainText()
+            cd = self.cd_edit.toPlainText()
+            ct = self.ct_edit.toPlainText()
+            da = self.da_edit.toPlainText()
 
-            def harvest(table: QTableWidget, cols: int):
-                rows = []
-                for r in range(table.rowCount()):
-                    row = []
-                    for c in range(cols):
-                        it = table.item(r, c)
-                        row.append(it.text().strip() if it else "")
-                    rows.append(row)
-                return rows
-
-            part_rows = harvest(self.part_table, len(PARTLIST_HEADERS))
-            pin_rows  = harvest(self.pin_table,  len(PIN_HEADERS))
-            test_rows = harvest(self.test_table, len(TEST_HEADERS))
-
-            text = self.build_markdown(fields, used_rows, netlist, part_rows, pin_rows, test_rows)
+            text = self.build_markdown(
+                fields, rev_rows, variant_items,
+                netlist, partlist_text, cd, ct, da
+            )
 
             try:
                 self.current_path.write_text(text, encoding="utf-8")
             except Exception as e:
                 self.error("Error", f"Failed to save file:\n{e}"); return
 
+            # Update raw view silently
+            self.review_edit.blockSignals(True)
+            self.review_edit.setPlainText(text)
+            self.review_edit.blockSignals(False)
+            self.review_dirty = False
+            self._clear_dirty()
+
             self.proxy.refresh_desc(self.current_path)
-            self.info("Saved", "Catalog entry saved.")
+            if not silent:
+                self.info("Saved", "Catalog entry saved.")
             return
 
-        # Otherwise save folder metadata if a folder is selected
+        # Save folder metadata
         if self.current_folder and self.current_folder.exists() and self.current_folder.is_dir():
             meta_p = folder_meta_path(self.current_folder)
-            # Preserve 'Created' if present
             created = today_iso()
             if meta_p.exists():
                 try:
@@ -1168,11 +1333,10 @@ class CatalogWindow(QMainWindow):
                 except Exception:
                     pass
 
-            # Build tags list (store as list)
             raw_tags = (self.folder_tags.text() or "").strip()
             tags_list = [t.strip() for t in raw_tags.split(",") if t.strip()]
 
-            meta = {
+            meta = ({
                 "TITLE": (self.folder_title.text() or "").upper(),
                 "DESCRIPTION": (self.folder_desc.text() or "").upper(),
                 "Summary": self.folder_summary.toPlainText().strip(),
@@ -1180,21 +1344,22 @@ class CatalogWindow(QMainWindow):
                 "Tags": tags_list,
                 "Created": created,
                 "Last Updated": today_iso(),
-            }
+            })
             try:
                 meta_p.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             except Exception as e:
                 self.error("Error", f"Failed to save folder metadata:\n{e}"); return
 
-            # Refresh tree "Description" (TITLE)
             self.proxy.refresh_desc(self.current_folder)
             self.folder_created.setText(meta["Created"])
             self.folder_updated.setText(meta["Last Updated"])
-
-            self.info("Saved", "Folder metadata saved.")
+            self._clear_dirty()
+            if not silent:
+                self.info("Saved", "Folder metadata saved.")
             return
 
-        self.info("Save", "Select a folder or a Markdown file to save.")
+        if not silent:
+            self.info("Save", "Select a folder or a Markdown file to save.")
 
     # --- Folder metadata / archive / file ops ----------------------------------
     def read_folder_meta(self, folder: Path) -> dict:
@@ -1214,7 +1379,6 @@ class CatalogWindow(QMainWindow):
             return meta
         try:
             meta = json.loads(meta_p.read_text(encoding="utf-8"))
-            # Backfill defaults if older schema
             meta.setdefault("TITLE", meta.get("title", "").upper() if meta.get("title") else meta.get("TITLE",""))
             meta.setdefault("DESCRIPTION", meta.get("description", "").upper() if meta.get("description") else meta.get("DESCRIPTION",""))
             meta.setdefault("Summary", meta.get("Summary", ""))
@@ -1237,7 +1401,6 @@ class CatalogWindow(QMainWindow):
             }
 
     def archive_script_folder(self):
-        """Zip the folder containing the running script, then move the zip INSIDE that folder (avoid self-inclusion)."""
         try:
             if getattr(sys, 'frozen', False):
                 script_dir = Path(sys.executable).resolve().parent
@@ -1268,7 +1431,6 @@ class CatalogWindow(QMainWindow):
         self.info("Archive", f"Created: {dest_zip}")
 
     def open_file_location(self):
-        """Open the selected folder (or the folder containing the selected file) in the OS file manager."""
         path = self.selected_path()
         if not path:
             self.info("Open Location", "Select a folder or file first.")
@@ -1286,7 +1448,6 @@ class CatalogWindow(QMainWindow):
                 else:
                     subprocess.run(["open", str(path.resolve())])
             else:
-                # Linux / others
                 target = str(path.parent.resolve() if path.is_file() else path.resolve())
                 subprocess.run(["xdg-open", target])
         except Exception as e:
@@ -1300,7 +1461,6 @@ class CatalogWindow(QMainWindow):
         target = base / name.strip()
         try:
             target.mkdir(parents=True, exist_ok=False)
-            # Initialize meta
             self.read_folder_meta(target)
             self.proxy.refresh_desc(target)
         except FileExistsError:
@@ -1343,27 +1503,19 @@ class CatalogWindow(QMainWindow):
 
         try:
             if path.is_dir():
-                # --- Folder rename flow ---
                 old_folder_name = path.name
-                # 1) Rename the folder
                 path.rename(new_path)
 
-                # 2) Fix the metadata json name inside the *renamed* folder
                 old_meta = new_path / f"{old_folder_name}.json"
                 new_meta = new_path / f"{new_path.name}.json"
 
                 if old_meta.exists():
                     if new_meta.exists():
-                        # If a correct json already exists, the old one is obsolete
-                        try:
-                            old_meta.unlink()
-                        except Exception:
-                            pass
+                        try: old_meta.unlink()
+                        except Exception: pass
                     else:
-                        try:
-                            old_meta.rename(new_meta)
+                        try: old_meta.rename(new_meta)
                         except Exception:
-                            # If rename fails for any reason, fall back to copy+delete
                             try:
                                 data = old_meta.read_text(encoding="utf-8")
                                 new_meta.write_text(data, encoding="utf-8")
@@ -1371,16 +1523,13 @@ class CatalogWindow(QMainWindow):
                             except Exception:
                                 pass
 
-                # Refresh tree desc (shows folder TITLE)
                 self.proxy.refresh_desc(new_path)
 
-                # Update selection bookkeeping if needed
                 if self.current_folder and self.current_folder == path:
                     self.current_folder = new_path
                     self.path_label.setText(f"Folder: {new_path}")
 
             else:
-                # --- File rename flow ---
                 path.rename(new_path)
                 self.proxy.refresh_desc(new_path)
                 if self.current_path and self.current_path == path:
@@ -1389,7 +1538,6 @@ class CatalogWindow(QMainWindow):
 
         except Exception as e:
             self.error("Error", f"Failed to rename:\n{e}")
-
 
     def delete_item(self):
         path = self.selected_path()
@@ -1409,17 +1557,126 @@ class CatalogWindow(QMainWindow):
             self.current_folder = None
             self.path_label.setText("")
 
-    # Used On helpers (add/remove a row)
-    def add_used_row(self):
-        r = self.used_table.rowCount()
-        self.used_table.insertRow(r)
-        self.used_table.setItem(r, 0, QTableWidgetItem(""))
-        self.used_table.setItem(r, 1, QTableWidgetItem("1"))
+    # --- Find: in-tab + catalog -------------------------------------------------
+    def _active_text_edit(self):
+        fw = QApplication.focusWidget()
+        if isinstance(fw, QTextEdit):
+            return fw
+        tab_text = self._strip_dot(self.tabs.tabText(self.tabs.currentIndex()))
+        mapping = {
+            "Netlist": self.netlist_edit,
+            "Partlist": self.partlist_edit,
+            "Circuit Description": self.cd_edit,
+            "Circuit Theory": self.ct_edit,
+            "Design Analysis": self.da_edit,
+            "Review": self.review_edit,
+        }
+        return mapping.get(tab_text)
 
-    def remove_used_row(self):
-        r = self.used_table.currentRow()
-        if r >= 0:
-            self.used_table.removeRow(r)
+    def find_in_active(self):
+        ed = self._active_text_edit()
+        if not ed:
+            self.warn("Find", "Nothing to search here (try the Review, Netlist, Partlist, or narrative tabs).")
+            return
+        text, ok = QInputDialog.getText(self, "Find", "Find text:", text=getattr(self, "last_find", ""))
+        if not ok or not text:
+            return
+        self.last_find = text
+        if not ed.find(self.last_find):
+            cursor = ed.textCursor()
+            cursor.movePosition(cursor.Start)
+            ed.setTextCursor(cursor)
+            ed.find(self.last_find)
+
+    def find_next(self):
+        ed = self._active_text_edit()
+        if not ed:
+            return
+        if not getattr(self, "last_find", ""):
+            return self.find_in_active()
+        if not ed.find(self.last_find):
+            cursor = ed.textCursor()
+            cursor.movePosition(cursor.Start)
+            ed.setTextCursor(cursor)
+            ed.find(self.last_find)
+
+    def find_prev(self):
+        ed = self._active_text_edit()
+        if not ed or not getattr(self, "last_find", ""):
+            return
+        if not ed.find(self.last_find, QTextDocument.FindBackward):
+            cursor = ed.textCursor()
+            cursor.movePosition(cursor.End)
+            ed.setTextCursor(cursor)
+            ed.find(self.last_find, QTextDocument.FindBackward)
+
+    def search_catalog(self):
+        query, ok = QInputDialog.getText(self, "Search in Catalog", "Find text (case-insensitive):", text=getattr(self, "last_find", ""))
+        if not ok or not query:
+            return
+        self.last_find = query
+        ql = query.lower()
+
+        matches = []  # (file_path, line_no, col, display_text)
+        root = self.catalog_root
+        for folder, _, files in os.walk(root):
+            for name in files:
+                if not name.lower().endswith(".md"):
+                    continue
+                p = Path(folder) / name
+                try:
+                    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+                except Exception:
+                    continue
+                for i, ln in enumerate(lines, start=1):
+                    col = ln.lower().find(ql)
+                    if col != -1:
+                        rel = str(p.relative_to(root)).replace("\\", "/")
+                        snippet = ln.strip()
+                        if len(snippet) > 140:
+                            snippet = snippet[:137] + "…"
+                        matches.append((p, i, col, f"{rel}:{i}: {snippet}"))
+        if not matches:
+            self.info("Search in Catalog", "No matches found.")
+            return
+
+        items = [m[3] for m in matches]
+        sel, ok = QInputDialog.getItem(self, "Search in Catalog", f"{len(matches)} matches. Select one:", items, 0, False)
+        if not ok or not sel:
+            return
+
+        idx = items.index(sel)
+        p, line_no, col, _ = matches[idx]
+        self._open_file_and_jump(p, line_no, col, len(query))
+
+    def _open_file_and_jump(self, path: Path, line_no: int, col: int, length: int):
+        sidx = self.fs_model.index(str(path))
+        if not sidx.isValid():
+            return
+        pidx = self.proxy.mapFromSource(sidx)
+        self.tree.setCurrentIndex(pidx)
+        self.tree.scrollTo(pidx)
+
+        def _do_jump():
+            # Switch to Review tab
+            for i in range(self.tabs.count()):
+                base = self._strip_dot(self.tabs.tabText(i))
+                if base == "Review":
+                    self.tabs.setCurrentIndex(i)
+                    break
+            text = self.review_edit.toPlainText()
+            pos = 0
+            lines = text.splitlines(True)
+            for i in range(min(len(lines), line_no - 1)):
+                pos += len(lines[i])
+            pos += col
+            cur = self.review_edit.textCursor()
+            cur.setPosition(pos)
+            cur.setPosition(pos + max(0, length), cur.KeepAnchor)
+            self.review_edit.setTextCursor(cur)
+            self.review_edit.ensureCursorVisible()
+
+        QTimer.singleShot(50, _do_jump)
 
 # --- Boot ---------------------------------------------------------------------
 
@@ -1431,7 +1688,6 @@ def ensure_catalog_root(start_dir: Path | None = None) -> Path:
         except Exception:
             pass
     if not root.exists() or not root.is_dir():
-        # Use a temporary dialog with dark titlebar + non-native Qt body
         dlg = QFileDialog()
         dlg.setFileMode(QFileDialog.Directory)
         dlg.setOption(QFileDialog.ShowDirsOnly, True)
@@ -1449,7 +1705,6 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle(QStyleFactory.create("Fusion"))
 
-    # 🗂️ app icon
     icon = make_emoji_icon("🗂️", px=256)
     app.setWindowIcon(icon)
 
