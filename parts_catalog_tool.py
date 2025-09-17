@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parts Catalog Tool — PyQt5 (Dark-only, Focused Editor v6)
+Parts Catalog Tool — PyQt5 (Dark-only, Focused Editor v7)
 - Single Save (toolbar + Ctrl+S) for files & folders
 - Metadata tab has subtabs:
     • Introduction (Title, Part Number, Notes, etc.)
@@ -9,16 +9,18 @@ Parts Catalog Tool — PyQt5 (Dark-only, Focused Editor v6)
 - Editor tabs: Metadata, Netlist (free text), Partlist (free text),
                Circuit Description (free text), Circuit Theory (free text),
                Design Analysis (free text), Review (raw Markdown)
-- Autosave + dirty indicator: autosave every N seconds and when switching selection; "●" on active tab + "•" in window title when unsaved
-- Global Find:
-    • Ctrl+F / F3 / Shift+F3 within active editor
-    • Ctrl+Shift+F to search across the catalog and jump to matches
+- Autosave + dirty indicator:
+    • Autosaves every N seconds *and* when switching tree selection
+    • Live toolbar countdown: “Autosave in: XXs” (counts only when there are unsaved edits)
+    • “●” on active tab + “•” in window title when unsaved
 - Folder metadata panel fills the right pane when a folder is selected
 - Drag & Drop tree with MOVE support (files and folders), resizable splitter
 - Tree shows Name + Description (files: Title field from Markdown; folders: TITLE from folder JSON)
 - Folder metadata JSON (<Folder>/<Folder>.json) with fields: TITLE, DESCRIPTION (UPPERCASE), Summary, Owner, Tags, Created, Last Updated
 - Archive: zips folder containing this script; archive saved inside as YYYYMMDD_HHMMSS.zip
 - App/window icon uses an emoji (🗂️)
+
+Note: Global/cross-file search features were removed per request.
 """
 
 import sys
@@ -33,7 +35,7 @@ import platform
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QSortFilterProxyModel, QModelIndex, QTimer
-from PyQt5.QtGui import QKeySequence, QIcon, QPixmap, QPainter, QFont, QTextDocument
+from PyQt5.QtGui import QKeySequence, QIcon, QPixmap, QPainter, QFont
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFileSystemModel, QTreeView, QToolBar, QAction, QFileDialog,
@@ -354,7 +356,11 @@ class CatalogWindow(QMainWindow):
         self.dirty = False
         self.suppress_dirty = False
         self.review_dirty = False
+
         self.autosave_interval_ms = 30000  # 30s
+        self.autosave_interval_s = self.autosave_interval_ms // 1000
+        self.autosave_remaining_s = self.autosave_interval_s
+
         self.base_tab_titles = []  # will be set after tabs are built
 
         # Toolbar
@@ -386,16 +392,11 @@ class CatalogWindow(QMainWindow):
         self.act_save.triggered.connect(self.save_from_form)
         tb.addAction(self.act_save)
 
-        # Find actions (global + in-tab)
-        act_find = QAction("🔍 Find", self);           act_find.setShortcut("Ctrl+F");        act_find.triggered.connect(self.find_in_active)
-        act_find_next = QAction("Find Next", self);    act_find_next.setShortcut("F3");       act_find_next.triggered.connect(self.find_next)
-        act_find_prev = QAction("Find Prev", self);    act_find_prev.setShortcut("Shift+F3"); act_find_prev.triggered.connect(self.find_prev)
-        act_find_catalog = QAction("🗂️ Search Catalog…", self); act_find_catalog.setShortcut("Ctrl+Shift+F"); act_find_catalog.triggered.connect(self.search_catalog)
-        tb.addAction(act_find); tb.addAction(act_find_next); tb.addAction(act_find_prev); tb.addAction(act_find_catalog)
-
-        # Export / Import
-        act_export = QAction("📤 Export Catalog", self); act_export.triggered.connect(self.export_catalog); tb.addAction(act_export)
-        act_import = QAction("📥 Import Catalog", self); act_import.triggered.connect(self.import_catalog); tb.addAction(act_import)
+        # Right-aligned autosave countdown label
+        spacer = QWidget(self); spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); tb.addWidget(spacer)
+        self.autosave_label = QLabel("Autosave in: —", self)
+        self.autosave_label.setStyleSheet("color:#A0A6AD; padding: 0 6px;")
+        tb.addWidget(self.autosave_label)
 
         # File system model / proxy
         self.fs_model = QFileSystemModel(self)
@@ -554,13 +555,14 @@ class CatalogWindow(QMainWindow):
 
         right_layout.addWidget(self.tabs, 1)
 
-        # After building tabs: set base titles, wire dirty + autosave
+        # After building tabs: set base titles, wire dirty + countdown autosave
         self.base_tab_titles = [self.tabs.tabText(i) for i in range(self.tabs.count())]
         self.tabs.currentChanged.connect(self.update_dirty_indicator)
 
-        self.autosave_timer = QTimer(self)
-        self.autosave_timer.timeout.connect(lambda: self.save_from_form(silent=True))
-        self.autosave_timer.start(self.autosave_interval_ms)
+        # Countdown timer (1s ticks) handles autosave + label update
+        self.countdown_timer = QTimer(self)
+        self.countdown_timer.timeout.connect(self._tick_autosave_countdown)
+        self.countdown_timer.start(1000)
 
         self._wire_dirty_signals()
 
@@ -576,9 +578,6 @@ class CatalogWindow(QMainWindow):
         # Dark stylesheet
         self.apply_dark_styles()
         self.show_file_ui(False)
-
-        # Find state
-        self.last_find = ""
 
     # ---------- Import / Export -------------------------------------------------
 
@@ -917,6 +916,9 @@ class CatalogWindow(QMainWindow):
             return
         if not self.dirty:
             self.dirty = True
+            # start/refresh countdown when first becoming dirty
+            self.autosave_remaining_s = self.autosave_interval_s
+            self.autosave_label.setText(f"Autosave in: {self.autosave_remaining_s}s")
             self.update_dirty_indicator()
 
     def update_dirty_indicator(self):
@@ -933,6 +935,30 @@ class CatalogWindow(QMainWindow):
         if self.dirty:
             self.dirty = False
             self.update_dirty_indicator()
+
+    def _reset_autosave_countdown(self):
+        self.autosave_remaining_s = self.autosave_interval_s
+        self.autosave_label.setText("Autosave in: —" if not self.dirty else f"Autosave in: {self.autosave_remaining_s}s")
+
+    def _tick_autosave_countdown(self):
+        # Only count when there's something to save
+        if not self.current_path and not self.current_folder:
+            self.autosave_label.setText("Autosave in: —")
+            self.autosave_remaining_s = self.autosave_interval_s
+            return
+        if not self.dirty:
+            # Idle / nothing to save
+            self.autosave_label.setText("Autosave in: —")
+            self.autosave_remaining_s = self.autosave_interval_s
+            return
+
+        # Countdown visible
+        if self.autosave_remaining_s <= 0:
+            self.save_from_form(silent=True)  # this clears dirty if save succeeds
+            self._reset_autosave_countdown()
+        else:
+            self.autosave_label.setText(f"Autosave in: {self.autosave_remaining_s}s")
+            self.autosave_remaining_s -= 1
 
     # --- UI helpers -------------------------------------------------------------
     def _on_review_changed(self):
@@ -989,6 +1015,7 @@ class CatalogWindow(QMainWindow):
         # Autosave before switching away
         if self.dirty:
             self.save_from_form(silent=True)
+            self._reset_autosave_countdown()
 
         path = self.selected_path()
         if not path: return
@@ -1019,6 +1046,7 @@ class CatalogWindow(QMainWindow):
         self.folder_updated.setText(meta.get("Last Updated", ""))
         self.suppress_dirty = False
         self._clear_dirty()
+        self._reset_autosave_countdown()
 
     def load_file(self, path: Path):
         try:
@@ -1069,6 +1097,7 @@ class CatalogWindow(QMainWindow):
 
         self.suppress_dirty = False
         self._clear_dirty()
+        self._reset_autosave_countdown()
 
         self.proxy.refresh_desc(path)
 
@@ -1149,6 +1178,8 @@ class CatalogWindow(QMainWindow):
 
         # Introduction table
         i = 0; n = len(lines)
+        # collect all fields (for optional migration if you add later)
+        all_fields = {}
         while i < n:
             if lines[i].strip().lower().startswith("| field") and "| value" in lines[i].lower():
                 i += 2
@@ -1157,6 +1188,7 @@ class CatalogWindow(QMainWindow):
                     if m:
                         field = m.group("field").strip()
                         value = m.group("value").strip()
+                        all_fields[field] = value
                         if field in fields: fields[field] = value
                     i += 1
                 break
@@ -1270,8 +1302,9 @@ class CatalogWindow(QMainWindow):
                     self.load_file(self.current_path)  # refresh all views for manual saves
                 self.review_dirty = False
                 self._clear_dirty()
-                if not silent:
-                    self.info("Saved", "Catalog entry saved from raw Markdown.")
+                self._reset_autosave_countdown()
+                # if not silent:
+                    # self.info("Saved", "Catalog entry saved from raw Markdown.")
                 return
 
             # Save from structured tabs
@@ -1316,10 +1349,11 @@ class CatalogWindow(QMainWindow):
             self.review_edit.blockSignals(False)
             self.review_dirty = False
             self._clear_dirty()
+            self._reset_autosave_countdown()
 
             self.proxy.refresh_desc(self.current_path)
-            if not silent:
-                self.info("Saved", "Catalog entry saved.")
+            # if not silent:
+                # self.info("Saved", "Catalog entry saved.")
             return
 
         # Save folder metadata
@@ -1354,6 +1388,7 @@ class CatalogWindow(QMainWindow):
             self.folder_created.setText(meta["Created"])
             self.folder_updated.setText(meta["Last Updated"])
             self._clear_dirty()
+            self._reset_autosave_countdown()
             if not silent:
                 self.info("Saved", "Folder metadata saved.")
             return
@@ -1556,127 +1591,6 @@ class CatalogWindow(QMainWindow):
         if self.current_folder and self.current_folder == path:
             self.current_folder = None
             self.path_label.setText("")
-
-    # --- Find: in-tab + catalog -------------------------------------------------
-    def _active_text_edit(self):
-        fw = QApplication.focusWidget()
-        if isinstance(fw, QTextEdit):
-            return fw
-        tab_text = self._strip_dot(self.tabs.tabText(self.tabs.currentIndex()))
-        mapping = {
-            "Netlist": self.netlist_edit,
-            "Partlist": self.partlist_edit,
-            "Circuit Description": self.cd_edit,
-            "Circuit Theory": self.ct_edit,
-            "Design Analysis": self.da_edit,
-            "Review": self.review_edit,
-        }
-        return mapping.get(tab_text)
-
-    def find_in_active(self):
-        ed = self._active_text_edit()
-        if not ed:
-            self.warn("Find", "Nothing to search here (try the Review, Netlist, Partlist, or narrative tabs).")
-            return
-        text, ok = QInputDialog.getText(self, "Find", "Find text:", text=getattr(self, "last_find", ""))
-        if not ok or not text:
-            return
-        self.last_find = text
-        if not ed.find(self.last_find):
-            cursor = ed.textCursor()
-            cursor.movePosition(cursor.Start)
-            ed.setTextCursor(cursor)
-            ed.find(self.last_find)
-
-    def find_next(self):
-        ed = self._active_text_edit()
-        if not ed:
-            return
-        if not getattr(self, "last_find", ""):
-            return self.find_in_active()
-        if not ed.find(self.last_find):
-            cursor = ed.textCursor()
-            cursor.movePosition(cursor.Start)
-            ed.setTextCursor(cursor)
-            ed.find(self.last_find)
-
-    def find_prev(self):
-        ed = self._active_text_edit()
-        if not ed or not getattr(self, "last_find", ""):
-            return
-        if not ed.find(self.last_find, QTextDocument.FindBackward):
-            cursor = ed.textCursor()
-            cursor.movePosition(cursor.End)
-            ed.setTextCursor(cursor)
-            ed.find(self.last_find, QTextDocument.FindBackward)
-
-    def search_catalog(self):
-        query, ok = QInputDialog.getText(self, "Search in Catalog", "Find text (case-insensitive):", text=getattr(self, "last_find", ""))
-        if not ok or not query:
-            return
-        self.last_find = query
-        ql = query.lower()
-
-        matches = []  # (file_path, line_no, col, display_text)
-        root = self.catalog_root
-        for folder, _, files in os.walk(root):
-            for name in files:
-                if not name.lower().endswith(".md"):
-                    continue
-                p = Path(folder) / name
-                try:
-                    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-                except Exception:
-                    continue
-                for i, ln in enumerate(lines, start=1):
-                    col = ln.lower().find(ql)
-                    if col != -1:
-                        rel = str(p.relative_to(root)).replace("\\", "/")
-                        snippet = ln.strip()
-                        if len(snippet) > 140:
-                            snippet = snippet[:137] + "…"
-                        matches.append((p, i, col, f"{rel}:{i}: {snippet}"))
-        if not matches:
-            self.info("Search in Catalog", "No matches found.")
-            return
-
-        items = [m[3] for m in matches]
-        sel, ok = QInputDialog.getItem(self, "Search in Catalog", f"{len(matches)} matches. Select one:", items, 0, False)
-        if not ok or not sel:
-            return
-
-        idx = items.index(sel)
-        p, line_no, col, _ = matches[idx]
-        self._open_file_and_jump(p, line_no, col, len(query))
-
-    def _open_file_and_jump(self, path: Path, line_no: int, col: int, length: int):
-        sidx = self.fs_model.index(str(path))
-        if not sidx.isValid():
-            return
-        pidx = self.proxy.mapFromSource(sidx)
-        self.tree.setCurrentIndex(pidx)
-        self.tree.scrollTo(pidx)
-
-        def _do_jump():
-            # Switch to Review tab
-            for i in range(self.tabs.count()):
-                base = self._strip_dot(self.tabs.tabText(i))
-                if base == "Review":
-                    self.tabs.setCurrentIndex(i)
-                    break
-            text = self.review_edit.toPlainText()
-            pos = 0
-            lines = text.splitlines(True)
-            for i in range(min(len(lines), line_no - 1)):
-                pos += len(lines[i])
-            pos += col
-            cur = self.review_edit.textCursor()
-            cur.setPosition(pos)
-            cur.setPosition(pos + max(0, length), cur.KeepAnchor)
-            self.review_edit.setTextCursor(cur)
-            self.review_edit.ensureCursorVisible()
-
-        QTimer.singleShot(50, _do_jump)
 
 # --- Boot ---------------------------------------------------------------------
 
