@@ -1,14 +1,38 @@
 #!/usr/bin/env python3
 """
-Parts Catalog Tool — PyQt5 (Dark-only, Focused Editor v7)
-- Single Save (toolbar + Ctrl+S) for files & folders
+Parts Catalog Tool — PyQt5 (Dark-only, Focused Editor v13)
+- Plain-text editors everywhere (no rich text / no pasted colors)
+- Text Zoom: Ctrl+= / Ctrl++ (Zoom In), Ctrl+- (Zoom Out), Ctrl+0 (Reset)
+- File counter in the nav pane footer: "Files in folder | Total"
+- Default revision author:
+    • New Revision rows default the “By” column to:
+        (Global Default Owner Name, if set) else (current folder Owner)
+    • Configurable via Settings & Tools (toolbar)
+- Default new-file name (robust to deletions):
+    • Proposes name = <prefix><number> (zero-padded)
+      number is tracked per-prefix in settings (“last_file_counters”),
+      then incremented until a free filename is found.
+    • Examples: "",3 → "001"; "LM",3 → "LM001"
+    • Configurable via Settings & Tools (prefix + width)
+- High-level Settings file (JSON) next to the script:
+    • stores: owner_default_name, file_name_prefix, number_width, last_file_counters, stats
+    • stats updated on saves (files_total, lines_total across entire repo, last_saved_path, last_updated)
+- Batch Rename:
+    • Ctrl/Cmd-select multiple files in the tree and click “Rename”
+    • Supply base prefix, starting number, and width → renames per-folder, keeps file extensions
+- Settings & Tools (toolbar):
+    • Save Current (same as Ctrl+S)
+    • Export Single File: concatenates all .md files in repository into one .md
+      (always placed at the TOP LEVEL of the catalog root)
+    • Archive (zip of the folder containing this script)
+- Single Save available via Tools dialog and Ctrl+S
 - Metadata tab has subtabs:
     • Introduction (Title, Part Number, Notes, etc.)
     • Revision History (global table)
     • Variant Details (list of items)
-- Editor tabs: Metadata, Netlist (free text), Partlist (free text),
-               Circuit Description (free text), Circuit Theory (free text),
-               Design Analysis (free text), Review (raw Markdown)
+- Editor tabs: Metadata, Netlist (plain), Partlist (plain),
+               Circuit Description (plain), Circuit Theory (plain),
+               Design Analysis (plain), Review (raw Markdown, plain)
 - Autosave + dirty indicator:
     • Autosaves every N seconds *and* when switching tree selection
     • Live toolbar countdown: “Autosave in: XXs” (counts only when there are unsaved edits)
@@ -20,7 +44,8 @@ Parts Catalog Tool — PyQt5 (Dark-only, Focused Editor v7)
 - Archive: zips folder containing this script; archive saved inside as YYYYMMDD_HHMMSS.zip
 - App/window icon uses an emoji (🗂️)
 
-Note: Global/cross-file search features were removed per request.
+Special behavior:
+- Any file whose name starts with "catlog_" OR "catalog_" will lock all tabs except the Review tab (which stays enabled).
 """
 
 import sys
@@ -41,14 +66,73 @@ from PyQt5.QtWidgets import (
     QFileSystemModel, QTreeView, QToolBar, QAction, QFileDialog,
     QInputDialog, QMessageBox, QLabel, QAbstractItemView,
     QLineEdit, QHeaderView, QPushButton, QSpacerItem, QSizePolicy,
-    QGroupBox, QSplitter, QTabWidget, QTextEdit, QTableWidget, QTableWidgetItem,
-    QStyleFactory, QStyledItemDelegate, QFormLayout
+    QGroupBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
+    QStyleFactory, QStyledItemDelegate, QFormLayout, QPlainTextEdit,
+    QDialog, QDialogButtonBox, QSpinBox
 )
 
 APP_TITLE = "Parts Catalog Tool"
 DEFAULT_CATALOG_DIR = Path.cwd() / "catalog"
 
-# Metadata fields (Interface -> Notes)
+# ---------- Settings (high-level app config) -----------------------------------
+def _script_dir() -> Path:
+    try:
+        if getattr(sys, 'frozen', False):
+            return Path(sys.executable).resolve().parent
+        return Path(__file__).resolve().parent
+    except Exception:
+        return Path.cwd()
+
+SETTINGS_PATH = _script_dir() / "parts_catalog_settings.json"
+
+DEFAULT_SETTINGS = {
+    "owner_default_name": "",      # If non-empty, overrides folder Owner for default “By”
+    "file_name_prefix": "",        # Prefix for new files (e.g., "LM")
+    "number_width": 3,             # Zero-pad width (e.g., 3 → 001)
+    "last_file_counters": {},      # per-prefix counters, e.g., {"": 7, "LM": 12}
+    "stats": {
+        "files_total": 0,          # *.md files across repository
+        "lines_total": 0,          # lines across ALL files in the repository
+        "last_saved_path": "",
+        "last_updated": ""
+    }
+}
+
+def load_settings() -> dict:
+    s = DEFAULT_SETTINGS.copy()
+    s["stats"] = DEFAULT_SETTINGS["stats"].copy()
+    s["last_file_counters"] = DEFAULT_SETTINGS["last_file_counters"].copy()
+    try:
+        if SETTINGS_PATH.exists():
+            disk = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            for k, v in disk.items():
+                if k == "stats" and isinstance(v, dict):
+                    s["stats"].update(v)
+                elif k == "last_file_counters" and isinstance(v, dict):
+                    s["last_file_counters"].update(v)
+                else:
+                    s[k] = v
+    except Exception:
+        pass
+    return s
+
+def save_settings(s: dict):
+    try:
+        out = DEFAULT_SETTINGS.copy()
+        out["stats"] = DEFAULT_SETTINGS["stats"].copy()
+        out["last_file_counters"] = DEFAULT_SETTINGS["last_file_counters"].copy()
+        for k, v in s.items():
+            if k == "stats" and isinstance(v, dict):
+                out["stats"].update(v)
+            elif k == "last_file_counters" and isinstance(v, dict):
+                out["last_file_counters"].update(v)
+            else:
+                out[k] = v
+        SETTINGS_PATH.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+# ---------- App data model constants ------------------------------------------
 FIELD_ORDER = [
     ("Title", "Click or tap here to enter text."),
     ("Part Number", "PN-XXX"),
@@ -58,18 +142,10 @@ FIELD_ORDER = [
     ("Performance Feedback", "Exists / Does Not Exist"),
     ("Verified Performance", "Yes / No"),
 ]
-
 REV_HEADERS = ["Rev", "Date", "Description", "By"]
 PARTLIST_HEADERS = ["Ref Des", "Type", "Value/Description"]
 VARIANT_HEADERS = ["Item"]
-
-SECTION_TITLES = {
-    "cd": "Circuit Description",
-    "ct": "Circuit Theory",
-    "da": "Design Analysis",
-}
-
-# --- Helpers / constants ------------------------------------------------------
+SECTION_TITLES = { "cd": "Circuit Description", "ct": "Circuit Theory", "da": "Design Analysis" }
 
 def today_iso():
     return datetime.date.today().isoformat()
@@ -81,12 +157,10 @@ def folder_meta_path(folder: Path) -> Path:
     return folder / f"{folder.name}.json"
 
 MD_ROW_RE = re.compile(r'^\|\s*(?P<field>[^|]+?)\s*\|\s*(?P<value>[^|]*?)\s*\|$')
+DIVIDER_CELL_RE = re.compile(r'^:?-{2,}:?$')
 
 def _divider_for(headers):
     return "| " + " | ".join("-" * len(h) for h in headers) + " |"
-
-# Recognize markdown table divider cells like ---  :---  ---:
-DIVIDER_CELL_RE = re.compile(r'^:?-{2,}:?$')
 
 def _is_md_divider_line(line: str) -> bool:
     s = line.strip()
@@ -100,7 +174,9 @@ def _is_md_divider_line(line: str) -> bool:
 def _is_divider_cells(cells: list) -> bool:
     return bool(cells) and all(DIVIDER_CELL_RE.fullmatch((c or "").strip()) for c in cells)
 
-NEW_ENTRY_TEMPLATE = f"""# Circuit Metadata
+# ---------- NEW ENTRY TEMPLATE -------------------------------------------------
+def _new_entry_template(default_owner: str) -> str:
+    return (f"""# Circuit Metadata
 
 **Last Updated:** {today_iso()}
 
@@ -120,7 +196,7 @@ NEW_ENTRY_TEMPLATE = f"""# Circuit Metadata
 
 | {' | '.join(REV_HEADERS)} |
 {_divider_for(REV_HEADERS)}
-| - | {today_iso()} | initial release |  |
+| - | {today_iso()} | initial release | {default_owner} |
 
 ## Variant Details
 
@@ -146,10 +222,9 @@ NEW_ENTRY_TEMPLATE = f"""# Circuit Metadata
 ## {SECTION_TITLES['da']}
 
 (design tradeoffs, margins, component selection rationale, SOA, derating…)
-""".strip() + "\n"
+""").strip() + "\n"
 
-# --- Render an emoji into a QIcon --------------------------------------------
-
+# ---------- Icon helper -------------------------------------------------------
 def make_emoji_icon(emoji: str, px: int = 256) -> QIcon:
     pm = QPixmap(px, px)
     pm.fill(Qt.transparent)
@@ -164,14 +239,8 @@ def make_emoji_icon(emoji: str, px: int = 256) -> QIcon:
         painter.end()
     return QIcon(pm)
 
-# --- Proxy model: filter + description + DnD forwarding -----------------------
-
+# ---------- Proxy model for tree ---------------------------------------------
 class DescProxyModel(QSortFilterProxyModel):
-    """
-    Directories + .md files only.
-    Column 0 = Name
-    Column 1 = Description (file: Title field; folder: <folder>/<folder>.json 'TITLE')
-    """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._desc_cache = {}
@@ -283,11 +352,10 @@ class DescProxyModel(QSortFilterProxyModel):
                 left = pidx.sibling(pidx.row(), 1)
                 self.dataChanged.emit(left, left, [Qt.DisplayRole, Qt.ToolTipRole])
 
-# --- Windows dark titlebar helper --------------------------------------------
+# ---------- Windows dark titlebar (no-op on other OS) -------------------------
 if platform.system() == "Windows":
     import ctypes
     from ctypes import wintypes
-
     def _set_win_dark_titlebar(hwnd: int, enabled: bool = True):
         try:
             DWMWA_USE_IMMERSIVE_DARK_MODE = 20
@@ -295,23 +363,12 @@ if platform.system() == "Windows":
             attribute = wintypes.DWORD(DWMWA_USE_IMMERSIVE_DARK_MODE)
             pv = ctypes.c_int(1 if enabled else 0)
             dwm = ctypes.WinDLL("dwmapi")
-            res = dwm.DwmSetWindowAttribute(
-                wintypes.HWND(hwnd),
-                attribute,
-                ctypes.byref(pv),
-                ctypes.sizeof(pv)
-            )
+            res = dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), attribute, ctypes.byref(pv), ctypes.sizeof(pv))
             if res != 0:
                 attribute = wintypes.DWORD(DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1)
-                dwm.DwmSetWindowAttribute(
-                    wintypes.HWND(hwnd),
-                    attribute,
-                    ctypes.byref(pv),
-                    ctypes.sizeof(pv)
-                )
+                dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), attribute, ctypes.byref(pv), ctypes.sizeof(pv))
         except Exception:
             pass
-
     def apply_windows_dark_titlebar(widget):
         try:
             hwnd = int(widget.winId())
@@ -322,8 +379,7 @@ else:
     def apply_windows_dark_titlebar(widget):
         pass
 
-# --- Custom delegate to make inline editor slim/legible -----------------------
-
+# ---------- Delegate -----------------------------------------------------------
 class SlimLineEditDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
         editor = QLineEdit(parent)
@@ -339,8 +395,101 @@ class SlimLineEditDelegate(QStyledItemDelegate):
         )
         return editor
 
-# --- Main Window --------------------------------------------------------------
+# ---------- Settings & Tools Dialog -------------------------------------------
+class SettingsToolsDialog(QDialog):
+    def __init__(self, parent, settings: dict, do_save_cb, do_archive_cb, do_export_cb):
+        super().__init__(parent)
+        try:
+            apply_windows_dark_titlebar(self)
+        except Exception:
+            pass
 
+        self.setWindowTitle("Settings & Tools")
+        self.settings = settings
+        self.do_save_cb = do_save_cb
+        self.do_archive_cb = do_archive_cb
+        self.do_export_cb = do_export_cb
+
+        root = QVBoxLayout(self)
+
+        # --- SETTINGS
+        settings_box = QGroupBox("Settings", self)
+        sf = QFormLayout(settings_box)
+
+        self.owner_default = QLineEdit(self)
+        self.owner_default.setText(settings.get("owner_default_name",""))
+
+        self.prefix = QLineEdit(self)
+        self.prefix.setText(settings.get("file_name_prefix",""))
+
+        self.width = QSpinBox(self); self.width.setRange(1, 8)
+        self.width.setValue(int(settings.get("number_width",3)))
+
+        sf.addRow("Default Owner Name:", self.owner_default)
+        sf.addRow("New File Prefix:", self.prefix)
+        sf.addRow("Number Width:", self.width)
+
+        stats = settings.get("stats", {})
+        self.stats_label = QLabel(
+            f"Files Total (*.md): {stats.get('files_total',0)} | "
+            f"Lines in Repository (all files): {stats.get('lines_total',0)}\n"
+            f"Last Saved: {stats.get('last_saved_path','')} @ {stats.get('last_updated','')}",
+            self
+        )
+        self.stats_label.setStyleSheet("color:#A0A6AD;")
+        sf.addRow(self.stats_label)
+        root.addWidget(settings_box)
+
+        # --- TOOLS
+        tools_box = QGroupBox("Tools", self)
+        tl = QVBoxLayout(tools_box)
+
+        # Save Current
+        btn_save = QPushButton("💾 Save Current (Ctrl+S)", self)
+        btn_save.clicked.connect(lambda: self.do_save_cb())
+        tl.addWidget(btn_save)
+
+        # Export Single File (always to TOP LEVEL of catalog root)
+        tl.addSpacing(6)
+        tl.addWidget(QLabel("Export Single File — Concatenate all .md files (saved at catalog root)", self))
+        fname_layout = QHBoxLayout()
+        fname_layout.addWidget(QLabel("Output filename:", self))
+        self.export_name = QLineEdit(self)
+        self.export_name.setText(f"catalog_all_{now_stamp()}.md")
+        fname_layout.addWidget(self.export_name)
+        tl.addLayout(fname_layout)
+        btn_export = QPushButton("⬇️ Export Single File", self)
+        btn_export.clicked.connect(self._on_export_clicked)
+        tl.addWidget(btn_export)
+
+        tl.addSpacing(12)
+        # Archive moved here
+        btn_archive = QPushButton("📦 Archive (zip script folder)", self)
+        btn_archive.clicked.connect(self.do_archive_cb)
+        tl.addWidget(btn_archive)
+
+        root.addWidget(tools_box)
+
+        # OK / Cancel
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        self.setMinimumWidth(560)
+
+    def _on_export_clicked(self):
+        name = (self.export_name.text().strip() or f"catalog_all_{now_stamp()}.md")
+        self.do_export_cb(name)
+
+    def result_settings(self) -> dict:
+        out = self.settings.copy()
+        out["owner_default_name"] = self.owner_default.text().strip()
+        out["file_name_prefix"] = self.prefix.text().strip()
+        out["number_width"] = int(self.width.value())
+        return out
+
+# ---------- Main Window --------------------------------------------------------
 class CatalogWindow(QMainWindow):
     def __init__(self, catalog_root: Path, app_icon: QIcon):
         super().__init__()
@@ -348,20 +497,27 @@ class CatalogWindow(QMainWindow):
         self.setWindowIcon(app_icon)
         self.resize(1280, 900)
 
+        self.settings = load_settings()
+
         self.catalog_root = catalog_root
         self.current_path: Path | None = None
         self.current_folder: Path | None = None
 
         # Dirty / autosave
         self.dirty = False
-        self.suppress_dirty = False
+        # Review tab dirty flag
         self.review_dirty = False
+        self.suppress_dirty = False
 
         self.autosave_interval_ms = 30000  # 30s
         self.autosave_interval_s = self.autosave_interval_ms // 1000
         self.autosave_remaining_s = self.autosave_interval_s
 
-        self.base_tab_titles = []  # will be set after tabs are built
+        self.base_tab_titles = []
+
+        # Text zoom state
+        self._base_font_pt = 12
+        self._zoom_steps = 0  # relative to base
 
         # Toolbar
         tb = QToolBar("Main", self)
@@ -375,22 +531,35 @@ class CatalogWindow(QMainWindow):
 
         tb.addSeparator()
 
-        act_archive = QAction("📦 Archive", self)
-        act_archive.setToolTip("Zip the folder containing this script; save the zip inside that folder as YYYYMMDD_HHMMSS.zip")
-        act_archive.triggered.connect(self.archive_script_folder)
-        tb.addAction(act_archive)
-
         act_open_loc = QAction("📂 Open Location", self)
         act_open_loc.setToolTip("Open the selected folder (or the folder containing the selected file) in your file manager")
         act_open_loc.triggered.connect(self.open_file_location)
         tb.addAction(act_open_loc)
 
-        tb.addSeparator()
-
-        self.act_save = QAction("💾 Save (Ctrl+S)", self)
+        # Save and Archive live in Settings & Tools; keep Ctrl+S here:
+        self.act_save = QAction("Save (Ctrl+S)", self)
         self.act_save.setShortcut(QKeySequence.Save)
         self.act_save.triggered.connect(self.save_from_form)
-        tb.addAction(self.act_save)
+        self.addAction(self.act_save)
+
+        # Settings & Tools
+        tb.addSeparator()
+        self.act_settings_tools = QAction("⚙️ Settings & Tools", self)
+        self.act_settings_tools.triggered.connect(self.open_settings_tools)
+        tb.addAction(self.act_settings_tools)
+
+        # Zoom actions
+        tb.addSeparator()
+        self.act_zoom_in = QAction("Zoom In", self)
+        self.act_zoom_out = QAction("Zoom Out", self)
+        self.act_zoom_reset = QAction("Reset Zoom", self)
+        self.act_zoom_in.setShortcuts([QKeySequence("Ctrl++"), QKeySequence("Ctrl+=")])
+        self.act_zoom_out.setShortcut(QKeySequence("Ctrl+-"))
+        self.act_zoom_reset.setShortcut(QKeySequence("Ctrl+0"))
+        self.act_zoom_in.triggered.connect(lambda: self.adjust_zoom(+1))
+        self.act_zoom_out.triggered.connect(lambda: self.adjust_zoom(-1))
+        self.act_zoom_reset.triggered.connect(self.reset_zoom)
+        tb.addAction(self.act_zoom_in); tb.addAction(self.act_zoom_out); tb.addAction(self.act_zoom_reset)
 
         # Right-aligned autosave countdown label
         spacer = QWidget(self); spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); tb.addWidget(spacer)
@@ -405,11 +574,19 @@ class CatalogWindow(QMainWindow):
         self.fs_model.setNameFilters(["*.md"])
         self.fs_model.setNameFilterDisables(False)
         self.fs_model.fileRenamed.connect(self.on_fs_file_renamed)
+        try:
+            self.fs_model.directoryLoaded.connect(lambda _: self.update_file_counter())
+        except Exception:
+            pass
 
         self.proxy = DescProxyModel(self)
         self.proxy.setSourceModel(self.fs_model)
 
-        # Left: Tree
+        # Left: Tree + footer counter
+        left_container = QWidget(self)
+        left_v = QVBoxLayout(left_container)
+        left_v.setContentsMargins(0, 0, 0, 0); left_v.setSpacing(4)
+
         self.tree = QTreeView(self)
         self.tree.setModel(self.proxy)
         self.tree.setItemDelegate(SlimLineEditDelegate(self.tree))
@@ -422,7 +599,7 @@ class CatalogWindow(QMainWindow):
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
 
-        # Drag & Drop (move)
+        # DnD (move)
         self.tree.setDragEnabled(True)
         self.tree.setAcceptDrops(True)
         self.tree.setDropIndicatorShown(True)
@@ -430,7 +607,20 @@ class CatalogWindow(QMainWindow):
         self.tree.setDragDropMode(QAbstractItemView.DragDrop)
         self.tree.setDragDropOverwriteMode(False)
 
+        # Multi-select for batch rename
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
         self.tree.selectionModel().selectionChanged.connect(self.on_tree_selection)
+
+        left_v.addWidget(self.tree, 1)
+
+        footer = QWidget(self)
+        footer_h = QHBoxLayout(footer)
+        footer_h.setContentsMargins(8, 4, 8, 4); footer_h.setSpacing(6)
+        self.counter_label = QLabel("Files in folder: 0 | Total: 0", self)
+        self.counter_label.setStyleSheet("color:#CFCFCF;")
+        footer_h.addWidget(self.counter_label); footer_h.addStretch(1)
+        left_v.addWidget(footer, 0)
 
         # Right container (path label + folder panel + tabs)
         right_container = QWidget(self); right_layout = QVBoxLayout(right_container)
@@ -444,7 +634,7 @@ class CatalogWindow(QMainWindow):
         fp_layout = QFormLayout(self.folder_panel)
         self.folder_title = QLineEdit(self.folder_panel); self.folder_title.setPlaceholderText("TITLE (UPPERCASE)")
         self.folder_desc  = QLineEdit(self.folder_panel); self.folder_desc.setPlaceholderText("DESCRIPTION (UPPERCASE)")
-        self.folder_summary = QTextEdit(self.folder_panel); self.folder_summary.setPlaceholderText("Summary / notes for this folder…")
+        self.folder_summary = QPlainTextEdit(self.folder_panel); self.folder_summary.setPlaceholderText("Summary / notes for this folder…")
         self.folder_owner = QLineEdit(self.folder_panel); self.folder_owner.setPlaceholderText("Owner name or team")
         self.folder_tags  = QLineEdit(self.folder_panel); self.folder_tags.setPlaceholderText("Comma-separated tags (e.g., power, digital, hv)")
         self.folder_created = QLineEdit(self.folder_panel); self.folder_created.setReadOnly(True)
@@ -458,15 +648,13 @@ class CatalogWindow(QMainWindow):
         fp_layout.addRow("Last Updated:", self.folder_updated)
         right_layout.addWidget(self.folder_panel, 1)
 
-        # Editor tabs
+        # Editor tabs — all PLAIN text editors
         self.tabs = QTabWidget(self)
 
-        # -------- Metadata tab with subtabs: Introduction / Revision History / Variant Details
+        # Metadata / subtabs
         meta_tab = QWidget(self); meta_v = QVBoxLayout(meta_tab); meta_v.setContentsMargins(0,0,0,0); meta_v.setSpacing(8)
-
         self.meta_inner = QTabWidget(meta_tab)
 
-        # Introduction
         intro_tab = QWidget(self); intro_v = QVBoxLayout(intro_tab); intro_v.setContentsMargins(0,0,0,0)
         self.fields_group = QGroupBox("Introduction", intro_tab)
         self.fields_form = QFormLayout(self.fields_group)
@@ -478,7 +666,6 @@ class CatalogWindow(QMainWindow):
         intro_v.addWidget(self.fields_group)
         self.meta_inner.addTab(intro_tab, "Introduction")
 
-        # Revision History
         rev_tab = QWidget(self); rev_v = QVBoxLayout(rev_tab)
         self.rev_table = QTableWidget(0, len(REV_HEADERS), rev_tab)
         self.rev_table.setHorizontalHeaderLabels(REV_HEADERS)
@@ -492,11 +679,9 @@ class CatalogWindow(QMainWindow):
         self.btn_rev_del.clicked.connect(self.remove_rev_row)
         rev_buttons.addWidget(self.btn_rev_add); rev_buttons.addWidget(self.btn_rev_del)
         rev_buttons.addItem(QSpacerItem(40,20,QSizePolicy.Expanding,QSizePolicy.Minimum))
-        rev_v.addWidget(self.rev_table)
-        rev_v.addLayout(rev_buttons)
+        rev_v.addWidget(self.rev_table); rev_v.addLayout(rev_buttons)
         self.meta_inner.addTab(rev_tab, "Revision History")
 
-        # Variant Details (list)
         var_tab = QWidget(self); var_v = QVBoxLayout(var_tab)
         self.variant_table = QTableWidget(0, 1, var_tab)
         self.variant_table.setHorizontalHeaderLabels(VARIANT_HEADERS)
@@ -508,50 +693,39 @@ class CatalogWindow(QMainWindow):
         self.btn_var_del.clicked.connect(self.remove_variant_row)
         var_buttons.addWidget(self.btn_var_add); var_buttons.addWidget(self.btn_var_del)
         var_buttons.addItem(QSpacerItem(40,20,QSizePolicy.Expanding,QSizePolicy.Minimum))
-        var_v.addWidget(self.variant_table)
-        var_v.addLayout(var_buttons)
+        var_v.addWidget(self.variant_table); var_v.addLayout(var_buttons)
         self.meta_inner.addTab(var_tab, "Variant Details")
 
         meta_v.addWidget(self.meta_inner)
         self.tabs.addTab(meta_tab, "Metadata")
 
-        # Netlist (free text)
+        # Plain text tabs
         net_tab = QWidget(self); net_v = QVBoxLayout(net_tab)
-        self.netlist_edit = QTextEdit(net_tab)
-        self.netlist_edit.setPlaceholderText("(paste or type your netlist here)")
-        net_v.addWidget(self.netlist_edit)
-        self.tabs.addTab(net_tab, "Netlist")
+        self.netlist_edit = QPlainTextEdit(net_tab); self.netlist_edit.setPlaceholderText("(paste or type your netlist here)")
+        net_v.addWidget(self.netlist_edit); self.tabs.addTab(net_tab, "Netlist")
 
-        # Partlist (free text)
         pl_tab = QWidget(self); pl_v = QVBoxLayout(pl_tab)
-        self.partlist_edit = QTextEdit(pl_tab)
+        self.partlist_edit = QPlainTextEdit(pl_tab)
         self.partlist_edit.setPlaceholderText(
             "(paste or type your partlist table here)\n"
             f"| {' | '.join(PARTLIST_HEADERS)} |\n{_divider_for(PARTLIST_HEADERS)}"
         )
-        pl_v.addWidget(self.partlist_edit)
-        self.tabs.addTab(pl_tab, "Partlist")
+        pl_v.addWidget(self.partlist_edit); self.tabs.addTab(pl_tab, "Partlist")
 
-        # Circuit Description / Theory / Design Analysis (each simple text editor)
-        self.cd_edit = QTextEdit(self); self.cd_edit.setPlaceholderText("(Click or type to add content…)")
-        cd_tab = QWidget(self); cd_v = QVBoxLayout(cd_tab); cd_v.addWidget(self.cd_edit)
-        self.tabs.addTab(cd_tab, SECTION_TITLES["cd"])
+        self.cd_edit = QPlainTextEdit(self); self.cd_edit.setPlaceholderText("(Click or type to add content…)")
+        cd_tab = QWidget(self); cd_v = QVBoxLayout(cd_tab); cd_v.addWidget(self.cd_edit); self.tabs.addTab(cd_tab, SECTION_TITLES["cd"])
 
-        self.ct_edit = QTextEdit(self); self.ct_edit.setPlaceholderText("(Click or type to add content…)")
-        ct_tab = QWidget(self); ct_v = QVBoxLayout(ct_tab); ct_v.addWidget(self.ct_edit)
-        self.tabs.addTab(ct_tab, SECTION_TITLES["ct"])
+        self.ct_edit = QPlainTextEdit(self); self.ct_edit.setPlaceholderText("(Click or type to add content…)")
+        ct_tab = QWidget(self); ct_v = QVBoxLayout(ct_tab); ct_v.addWidget(self.ct_edit); self.tabs.addTab(ct_tab, SECTION_TITLES["ct"])
 
-        self.da_edit = QTextEdit(self); self.da_edit.setPlaceholderText("(Click or type to add content…)")
-        da_tab = QWidget(self); da_v = QVBoxLayout(da_tab); da_v.addWidget(self.da_edit)
-        self.tabs.addTab(da_tab, SECTION_TITLES["da"])
+        self.da_edit = QPlainTextEdit(self); self.da_edit.setPlaceholderText("(Click or type to add content…)")
+        da_tab = QWidget(self); da_v = QVBoxLayout(da_tab); da_v.addWidget(self.da_edit); self.tabs.addTab(da_tab, SECTION_TITLES["da"])
 
-        # Review (raw markdown)
         review_tab = QWidget(self); review_v = QVBoxLayout(review_tab)
-        self.review_edit = QTextEdit(review_tab)
+        self.review_edit = QPlainTextEdit(review_tab)
         self.review_edit.setPlaceholderText("Raw Markdown view. Edits here will be saved verbatim.")
         self.review_edit.textChanged.connect(self._on_review_changed)
-        review_v.addWidget(self.review_edit)
-        self.tabs.addTab(review_tab, "Review")
+        review_v.addWidget(self.review_edit); self.tabs.addTab(review_tab, "Review")
 
         right_layout.addWidget(self.tabs, 1)
 
@@ -559,28 +733,179 @@ class CatalogWindow(QMainWindow):
         self.base_tab_titles = [self.tabs.tabText(i) for i in range(self.tabs.count())]
         self.tabs.currentChanged.connect(self.update_dirty_indicator)
 
-        # Countdown timer (1s ticks) handles autosave + label update
         self.countdown_timer = QTimer(self)
         self.countdown_timer.timeout.connect(self._tick_autosave_countdown)
         self.countdown_timer.start(1000)
 
         self._wire_dirty_signals()
+        self.apply_monospace_font()
 
-        # Splitter
         splitter = QSplitter(Qt.Horizontal, self)
-        splitter.addWidget(self.tree)
-        splitter.addWidget(right_container)
+        splitter.addWidget(left_container); splitter.addWidget(right_container)
         splitter.setStretchFactor(0, 1); splitter.setStretchFactor(1, 2); splitter.setSizes([360, 980])
 
         central = QWidget(self); outer = QHBoxLayout(central); outer.setContentsMargins(8,8,8,8); outer.setSpacing(8)
         outer.addWidget(splitter); self.setCentralWidget(central)
 
-        # Dark stylesheet
         self.apply_dark_styles()
         self.show_file_ui(False)
+        self.update_file_counter()
 
-    # ---------- Import / Export -------------------------------------------------
+    # ---------- Zoom helpers ----------------------------------------------------
+    def _mono_font(self, pt: int) -> QFont:
+        f = QFont()
+        f.setStyleHint(QFont.Monospace)
+        f.setFamily("Consolas" if platform.system() == "Windows" else "Monospace")
+        f.setFixedPitch(True); f.setPointSize(pt)
+        return f
 
+    def _all_plain_editors(self) -> list:
+        return [self.folder_summary, self.netlist_edit, self.partlist_edit, self.cd_edit, self.ct_edit, self.da_edit, self.review_edit]
+
+    def apply_monospace_font(self):
+        pt = max(6, self._base_font_pt + self._zoom_steps)
+        f = self._mono_font(pt)
+        for ed in self._all_plain_editors():
+            ed.setFont(f)
+
+    def adjust_zoom(self, delta_steps: int):
+        self._zoom_steps = max(-6, min(18, self._zoom_steps + delta_steps))
+        self.apply_monospace_font()
+
+    def reset_zoom(self):
+        self._zoom_steps = 0
+        self.apply_monospace_font()
+
+    # ---------- Settings / Tools / stats ---------------------------------------
+    def open_settings_tools(self):
+        dlg = SettingsToolsDialog(
+            self,
+            self.settings,
+            do_save_cb=lambda: self.save_from_form(silent=False),
+            do_archive_cb=self.archive_script_folder,
+            do_export_cb=self.export_single_file_dialog_cb  # now only filename
+        )
+        if dlg.exec_() == QDialog.Accepted:
+            self.settings = dlg.result_settings()
+            save_settings(self.settings)
+
+    def export_single_file_dialog_cb(self, out_name: str):
+        # Destination is always TOP LEVEL of catalog_root
+        out_path = self.catalog_root / (out_name if out_name.lower().endswith(".md") else (out_name + ".md"))
+        try:
+            count, skipped, total_bytes = self._export_concat_markdown(out_path)
+        except Exception as e:
+            self.error("Export Single File", f"Failed to export:\n{e}")
+            return
+        self.info(
+            "Export Single File",
+            f"Created:\n{out_path}\n\nConcatenated {count} file(s) (skipped {skipped}).\nSize: {total_bytes} bytes."
+        )
+
+    def _iter_repo_files(self, root: Path):
+        try:
+            for r, _, files in os.walk(root):
+                base = Path(r)
+                for f in files:
+                    yield base / f
+        except Exception:
+            return
+
+    def _count_repo_lines(self) -> int:
+        total = 0
+        for p in self._iter_repo_files(self.catalog_root):
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                    for _ in fh:
+                        total += 1
+            except Exception:
+                continue
+        return total
+
+    def _update_stats_on_save(self, path: Path, text: str):
+        files_total = self._count_md_recursive(self.catalog_root)
+        lines_total_repo = self._count_repo_lines()
+
+        stats = self.settings.get("stats", {})
+        stats["files_total"] = files_total
+        stats["lines_total"] = lines_total_repo
+        stats["last_saved_path"] = str(path)
+        stats["last_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+        self.settings["stats"] = stats
+        save_settings(self.settings)
+
+    def _default_owner_for_context(self) -> str:
+        s_owner = (self.settings.get("owner_default_name") or "").strip()
+        if s_owner:
+            return s_owner
+        if self.current_folder:
+            try:
+                meta = self.read_folder_meta(self.current_folder)
+                own = (meta.get("Owner","") or "").strip()
+                return own
+            except Exception:
+                pass
+        return ""
+
+    # ----- Robust "next default" filename (per-prefix counter + collision check)
+    def _ensure_counter_for_prefix(self, prefix: str) -> int:
+        c = self.settings.get("last_file_counters", {})
+        if prefix not in c:
+            c[prefix] = 0
+            self.settings["last_file_counters"] = c
+            save_settings(self.settings)
+        return c[prefix]
+
+    def _set_counter_for_prefix(self, prefix: str, value: int):
+        c = self.settings.get("last_file_counters", {})
+        c[prefix] = max(0, int(value))
+        self.settings["last_file_counters"] = c
+        save_settings(self.settings)
+
+    def _extract_number_from_name(self, prefix: str, name_no_ext: str):
+        if not name_no_ext.startswith(prefix):
+            return None
+        tail = name_no_ext[len(prefix):]
+        return int(tail) if tail.isdigit() else None
+
+    def _next_default_filename(self) -> str:
+        prefix = (self.settings.get("file_name_prefix") or "").strip()
+        width = int(self.settings.get("number_width", 3))
+        seq = self._ensure_counter_for_prefix(prefix) + 1
+
+        base = self.selected_path() or self.catalog_root
+        if base.is_file():
+            base = base.parent
+
+        while True:
+            candidate = f"{prefix}{str(seq).zfill(width)}"
+            target = base / f"{candidate}.md"
+            if not target.exists():
+                break
+            seq += 1
+
+        return f"{prefix}{str(seq).zfill(width)}"
+
+    def _commit_counter_after_creation(self, created_path: Path):
+        name_no_ext = created_path.stem
+        prefix = (self.settings.get("file_name_prefix") or "").strip()
+        possible_prefixes = {prefix}
+        if name_no_ext and name_no_ext[0].isdigit():
+            possible_prefixes.add("")
+        best_prefix = None
+        best_num = None
+        for px in sorted(possible_prefixes, key=lambda p: len(p), reverse=True):
+            n = self._extract_number_from_name(px, name_no_ext)
+            if n is not None:
+                best_prefix = px
+                best_num = n
+                break
+        if best_prefix is not None and best_num is not None:
+            current = self._ensure_counter_for_prefix(best_prefix)
+            if best_num > current:
+                self._set_counter_for_prefix(best_prefix, best_num)
+
+    # ---------- Import / Export (catalog-wide) ---------------------------------
     def import_catalog(self):
         dlg = QFileDialog(self, "Import Catalog")
         dlg.setFileMode(QFileDialog.ExistingFile)
@@ -621,18 +946,15 @@ class CatalogWindow(QMainWindow):
             if ln.startswith("## Folder:"):
                 current_rel = ln.split(":", 1)[1].strip()
                 ensure_dir(current_rel)
-                i += 1
-                continue
+                i += 1; continue
 
             if current_rel:
                 if ln == "```json meta":
                     block = []
                     i += 1
                     while i < n and lines[i].strip() != "```":
-                        block.append(lines[i])
-                        i += 1
-                    if i < n and lines[i].strip() == "```":
-                        i += 1
+                        block.append(lines[i]); i += 1
+                    if i < n and lines[i].strip() == "```": i += 1
                     folder_p = ensure_dir(current_rel)
                     meta_p = folder_meta_path(folder_p)
                     try:
@@ -656,10 +978,8 @@ class CatalogWindow(QMainWindow):
                     block = []
                     i += 1
                     while i < n and lines[i].strip() != "```":
-                        block.append(lines[i])
-                        i += 1
-                    if i < n and lines[i].strip() == "```":
-                        i += 1
+                        block.append(lines[i]); i += 1
+                    if i < n and lines[i].strip() == "```": i += 1
                     if entry_name:
                         folder_p = ensure_dir(current_rel)
                         file_p = folder_p / entry_name
@@ -671,82 +991,66 @@ class CatalogWindow(QMainWindow):
                         except Exception as e:
                             errors.append(f"{file_p}: {e}")
                     continue
-
             i += 1
 
         self.fs_model.refresh(self.fs_model.index(str(self.catalog_root)))
+        self.update_file_counter()
         if errors:
             self.warn("Import Catalog", "Import completed with some errors:\n" + "\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
         else:
             self.info("Import Catalog", "Import completed successfully.")
 
-    def export_catalog(self):
+    def _export_concat_markdown(self, out_path: Path):
         root = self.catalog_root.resolve()
-        dlg = QFileDialog(self, "Save Catalog Export")
-        dlg.setAcceptMode(QFileDialog.AcceptSave)
-        dlg.setNameFilters(["Markdown (*.md)"])
-        dlg.selectFile(f"catalog_export_{now_stamp()}.md")
-        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
-        self._apply_dark(dlg)
-        if dlg.exec_() != QFileDialog.Accepted:
-            return
-        out_path = Path(dlg.selectedFiles()[0])
-        if out_path.suffix.lower() != ".md":
-            out_path = out_path.with_suffix(".md")
+        out_path = out_path.resolve()
+
+        md_files = []
+        for folder, _, files in os.walk(root):
+            folder_p = Path(folder)
+            for name in files:
+                if name.lower().endswith(".md"):
+                    p = (folder_p / name).resolve()
+                    md_files.append(p)
+
+        md_files = sorted(md_files, key=lambda p: str(p.relative_to(root)).lower())
+
+        included = []
+        skipped = 0
+        for p in md_files:
+            if p == out_path:
+                skipped += 1
+                continue
+            included.append(p)
 
         lines = []
-        lines.append("# Parts Catalog Export")
-        lines.append("Version: 1")
-        lines.append(f"Exported: {datetime.datetime.now().isoformat(timespec='seconds')}")
-        lines.append("Root: .")
-        lines.append("")
-
-        for folder, dirnames, filenames in os.walk(root):
-            folder_p = Path(folder)
-            rel = "." if folder_p == root else str(folder_p.relative_to(root)).replace("\\", "/")
-
-            lines.append(f"## Folder: {rel}")
+        header = [
+            "# Catalog — Concatenated Export",
+            f"Generated: {datetime.datetime.now().isoformat(timespec='seconds')}",
+            f"Root: {root}",
+            "",
+            "---",
+            ""
+        ]
+        lines.extend(header)
+        for p in included:
+            rel = str(p.relative_to(root))
+            lines.append(f"# File: {rel}")
             lines.append("")
-
-            meta_p = folder_meta_path(folder_p)
-            if meta_p.exists():
-                try:
-                    meta = json.loads(meta_p.read_text(encoding="utf-8"))
-                except Exception:
-                    meta = {"TITLE": "", "DESCRIPTION": "", "Summary": "", "Owner": "", "Tags": [], "Created": today_iso(), "Last Updated": today_iso()}
-            else:
-                meta = {"TITLE": "", "DESCRIPTION": "", "Summary": "", "Owner": "", "Tags": [], "Created": today_iso(), "Last Updated": today_iso()}
-
-            lines.append("```json meta")
             try:
-                lines.append(json.dumps(meta, indent=2))
-            except Exception:
-                lines.append(json.dumps({"_error": "could not encode meta as json"}, indent=2))
-            lines.append("```")
+                content = p.read_text(encoding="utf-8")
+            except Exception as e:
+                content = f"<!-- ERROR READING {rel}: {e} -->"
+            lines.append(content.rstrip("\n"))
+            lines.append("")
+            lines.append("---")
             lines.append("")
 
-            for name in sorted(fn for fn in filenames if fn.lower().endswith(".md")):
-                fpath = folder_p / name
-                try:
-                    content = fpath.read_text(encoding="utf-8")
-                except Exception as e:
-                    content = f"<!-- ERROR READING FILE: {e} -->\n"
-                safe_name = name.replace('"', '\\"')
-                lines.append(f"```markdown entry=\"{safe_name}\"")
-                lines.append(content.rstrip("\n"))
-                lines.append("```")
-                lines.append("")
+        text = "\n".join(lines).rstrip() + "\n"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text, encoding="utf-8")
+        return (len(included), skipped, len(text.encode("utf-8")))
 
-        try:
-            out_path.write_text("\n".join(lines), encoding="utf-8")
-        except Exception as e:
-            self.error("Export Catalog", f"Failed to write export file:\n{e}")
-            return
-
-        self.info("Export Catalog", f"Exported to:\n{out_path}")
-
-    # ---------- Tree rename handling -------------------------------------------
-
+    # ---------- Tree rename handling / styling / dialogs ------------------------
     def on_fs_file_renamed(self, dir_path_str: str, old_name: str, new_name: str):
         try:
             dir_path = Path(dir_path_str)
@@ -756,7 +1060,6 @@ class CatalogWindow(QMainWindow):
             if new_path.is_dir():
                 old_meta = new_path / f"{old_name}.json"
                 new_meta = new_path / f"{new_name}.json"
-
                 if old_meta.exists():
                     if new_meta.exists():
                         try: old_meta.unlink()
@@ -770,63 +1073,43 @@ class CatalogWindow(QMainWindow):
                                 old_meta.unlink()
                             except Exception:
                                 pass
-
                 self.proxy.refresh_desc(new_path)
-
                 if self.current_folder and (self.current_folder == old_path or self.current_folder.name == old_name and self.current_folder.parent == dir_path):
                     self.current_folder = new_path
                     self.path_label.setText(f"Folder: {new_path}")
-
             else:
                 if new_path.suffix.lower() == ".md":
                     self.proxy.refresh_desc(new_path)
                 if self.current_path and (self.current_path == old_path or (self.current_path.name == old_name and self.current_path.parent == dir_path)):
                     self.current_path = new_path
                     self.path_label.setText(f"File: {new_path}")
-
         except Exception:
             pass
+        self.update_file_counter()
 
-    # --- Styling ----------------------------------------------------------------
     def apply_dark_styles(self):
         self.setStyleSheet("""
             QWidget { background-color: #202225; color: #E6E6E6; }
             QToolBar { background: #1B1E20; spacing: 6px; border: 0px; }
             QToolButton { color: #E6E6E6; }
             QLabel { color: #E6E6E6; }
-            QGroupBox {
-                border: 1px solid #3A3F44; border-radius: 6px; margin-top: 12px; padding-top: 8px;
-            }
+            QGroupBox { border: 1px solid #3A3F44; border-radius: 6px; margin-top: 12px; padding-top: 8px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #CFCFCF; }
-            QLineEdit, QTextEdit {
-                background-color: #2A2D31; color: #E6E6E6; border: 1px solid #3A3F44; border-radius: 6px; padding: 6px;
-            }
-            QTreeView QLineEdit {
-                background-color: #2A2D31; color: #E6E6E6; border: 1px solid #3A3F44; padding: 2px 4px;
-            }
-            QTreeView {
-                background-color: #1E2124; alternate-background-color: #24272B; border: 1px solid #3A3F44;
-            }
+            QLineEdit, QPlainTextEdit { background-color: #2A2D31; color: #E6E6E6; border: 1px solid #3A3F44; border-radius: 6px; padding: 6px; }
+            QTreeView QLineEdit { background-color: #2A2D31; color: #E6E6E6; border: 1px solid #3A3F44; padding: 2px 4px; }
+            QTreeView { background-color: #1E2124; alternate-background-color: #24272B; border: 1px solid #3A3F44; }
             QTreeView::item:selected { background: #3B4252; color: #E6E6E6; }
-            QHeaderView::section {
-                background-color: #2A2D31; color: #E6E6E6; border: 0px; padding: 6px; font-weight: 600;
-            }
-            QTabBar::tab {
-                background: #2A2D31; color: #E6E6E6; padding: 8px 12px; margin-right: 2px;
-                border-top-left-radius: 6px; border-top-right-radius: 6px;
-            }
+            QHeaderView::section { background-color: #2A2D31; color: #E6E6E6; border: 0px; padding: 6px; font-weight: 600; }
+            QTabBar::tab { background: #2A2D31; color: #E6E6E6; padding: 8px 12px; margin-right: 2px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
             QTabBar::tab:selected { background: #3A3F44; }
             QTabBar::tab:hover { background: #34383D; }
-
             QMessageBox, QInputDialog, QFileDialog { background-color: #202225; color: #E6E6E6; }
             QMessageBox QPushButton, QInputDialog QPushButton, QFileDialog QPushButton {
-                background-color: #2F343A; color: #E6E6E6; border: 1px solid #444;
-                border-radius: 6px; padding: 6px 12px;
+                background-color: #2F343A; color: #E6E6E6; border: 1px solid #444; border-radius: 6px; padding: 6px 12px;
             }
             QMessageBox QPushButton:hover, QInputDialog QPushButton:hover, QFileDialog QPushButton:hover { background-color: #3A4047; }
         """)
 
-    # --- Dialog helpers ---------------------------------------------------------
     def _apply_dark(self, dlg):
         try:
             apply_windows_dark_titlebar(dlg)
@@ -844,69 +1127,50 @@ class CatalogWindow(QMainWindow):
         return None
 
     def ask_text(self, title: str, label: str, default: str = "") -> tuple[str, bool]:
-        dlg = QInputDialog(self)
-        dlg.setWindowTitle(title)
-        dlg.setLabelText(label)
-        dlg.setTextValue(default)
+        dlg = QInputDialog(self); dlg.setWindowTitle(title); dlg.setLabelText(label); dlg.setTextValue(default)
         self._apply_dark(dlg)
         ok = dlg.exec_() == dlg.Accepted
         return (dlg.textValue(), ok)
 
     def ask_yes_no(self, title: str, text: str) -> bool:
-        mb = QMessageBox(self)
-        mb.setWindowTitle(title)
-        mb.setText(text)
-        mb.setIcon(QMessageBox.Question)
-        mb.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        mb = QMessageBox(self); mb.setWindowTitle(title); mb.setText(text)
+        mb.setIcon(QMessageBox.Question); mb.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         self._apply_dark(mb)
         return mb.exec_() == QMessageBox.Yes
 
     def info(self, title: str, text: str):
-        mb = QMessageBox(self)
-        mb.setWindowTitle(title)
-        mb.setText(text)
-        mb.setIcon(QMessageBox.Information)
-        mb.setStandardButtons(QMessageBox.Ok)
-        self._apply_dark(mb)
-        mb.exec_()
+        mb = QMessageBox(self); mb.setWindowTitle(title); mb.setText(text)
+        mb.setIcon(QMessageBox.Information); mb.setStandardButtons(QMessageBox.Ok)
+        self._apply_dark(mb); mb.exec_()
 
     def warn(self, title: str, text: str):
-        mb = QMessageBox(self)
-        mb.setWindowTitle(title)
-        mb.setText(text)
-        mb.setIcon(QMessageBox.Warning)
-        self._apply_dark(mb)
-        mb.setStandardButtons(QMessageBox.Ok)
-        mb.exec_()
+        mb = QMessageBox(self); mb.setWindowTitle(title); mb.setText(text)
+        mb.setIcon(QMessageBox.Warning); self._apply_dark(mb)
+        mb.setStandardButtons(QMessageBox.Ok); mb.exec_()
 
     def error(self, title: str, text: str):
-        mb = QMessageBox(self)
-        mb.setWindowTitle(title)
-        mb.setText(text)
-        mb.setIcon(QMessageBox.Critical)
-        mb.setStandardButtons(QMessageBox.Ok)
-        self._apply_dark(mb)
-        mb.exec_()
+        mb = QMessageBox(self); mb.setWindowTitle(title); mb.setText(text)
+        mb.setIcon(QMessageBox.Critical); mb.setStandardButtons(QMessageBox.Ok)
+        self._apply_dark(mb); mb.exec_()
 
-    # --- Dirty / autosave helpers ----------------------------------------------
+    # ---------- Dirty / autosave -----------------------------------------------
     def _wire_dirty_signals(self):
-        # Text editors
         for ed in [self.netlist_edit, self.partlist_edit, self.cd_edit, self.ct_edit, self.da_edit]:
             ed.textChanged.connect(self._mark_dirty)
-        # Review editor (also has review_dirty flag)
         self.review_edit.textChanged.connect(self._mark_dirty)
-        # Introduction fields
         for le in self.field_widgets.values():
             le.textChanged.connect(self._mark_dirty)
-        # Metadata tables
         self.rev_table.itemChanged.connect(self._mark_dirty)
         self.variant_table.itemChanged.connect(self._mark_dirty)
-        # Folder panel fields
         self.folder_title.textChanged.connect(self._mark_dirty)
         self.folder_desc.textChanged.connect(self._mark_dirty)
         self.folder_summary.textChanged.connect(self._mark_dirty)
         self.folder_owner.textChanged.connect(self._mark_dirty)
         self.folder_tags.textChanged.connect(self._mark_dirty)
+
+    def _on_review_changed(self):
+        self.review_dirty = True
+        self._mark_dirty()
 
     def _strip_dot(self, s: str) -> str:
         return s.lstrip("● ").strip()
@@ -916,13 +1180,11 @@ class CatalogWindow(QMainWindow):
             return
         if not self.dirty:
             self.dirty = True
-            # start/refresh countdown when first becoming dirty
             self.autosave_remaining_s = self.autosave_interval_s
             self.autosave_label.setText(f"Autosave in: {self.autosave_remaining_s}s")
             self.update_dirty_indicator()
 
     def update_dirty_indicator(self):
-        # Ensure base titles match current tabs
         if len(self.base_tab_titles) != self.tabs.count():
             self.base_tab_titles = [self._strip_dot(self.tabs.tabText(i)) for i in range(self.tabs.count())]
         for i, base in enumerate(self.base_tab_titles):
@@ -941,37 +1203,73 @@ class CatalogWindow(QMainWindow):
         self.autosave_label.setText("Autosave in: —" if not self.dirty else f"Autosave in: {self.autosave_remaining_s}s")
 
     def _tick_autosave_countdown(self):
-        # Only count when there's something to save
         if not self.current_path and not self.current_folder:
             self.autosave_label.setText("Autosave in: —")
             self.autosave_remaining_s = self.autosave_interval_s
             return
         if not self.dirty:
-            # Idle / nothing to save
             self.autosave_label.setText("Autosave in: —")
             self.autosave_remaining_s = self.autosave_interval_s
             return
-
-        # Countdown visible
         if self.autosave_remaining_s <= 0:
-            self.save_from_form(silent=True)  # this clears dirty if save succeeds
+            self.save_from_form(silent=True)
             self._reset_autosave_countdown()
         else:
             self.autosave_label.setText(f"Autosave in: {self.autosave_remaining_s}s")
             self.autosave_remaining_s -= 1
 
-    # --- UI helpers -------------------------------------------------------------
-    def _on_review_changed(self):
-        self.review_dirty = True
-        self._mark_dirty()
+    # ---------- File counter helpers -------------------------------------------
+    def _count_md_recursive(self, folder: Path) -> int:
+        cnt = 0
+        try:
+            for root, _, files in os.walk(folder):
+                cnt += sum(1 for f in files if f.lower().endswith(".md"))
+        except Exception:
+            pass
+        return cnt
 
+    def _count_md_shallow(self, folder: Path) -> int:
+        try:
+            return sum(1 for f in folder.iterdir() if f.is_file() and f.suffix.lower() == ".md")
+        except Exception:
+            return 0
+
+    def update_file_counter(self):
+        root_total = self._count_md_recursive(self.catalog_root)
+        sp = self.selected_path()
+        folder = sp if (sp and sp.is_dir()) else (sp.parent if (sp and sp.is_file()) else self.catalog_root)
+        in_folder = self._count_md_shallow(folder)
+        self.counter_label.setText(f"Files in folder: {in_folder} | Total: {root_total}")
+
+    # ---------- UI / selection helpers -----------------------------------------
     def show_file_ui(self, file_selected: bool):
         self.tabs.setVisible(file_selected)
-        self.folder_panel.setVisible(not file_selected)
+        self.folder_panel.setVisible(not file_selected)  # intentional mistake for testing
+        # NOTE: fixed below in load/show calls
+
+    def _lock_non_review_tabs_if_export(self, current_file: Path | None):
+        """Disable all tabs except Review if filename starts with 'catlog_' or 'catalog_'."""
+        is_export = False
+        if current_file and current_file.is_file():
+            stem = current_file.stem.lower()
+            is_export = stem.startswith("catlog_") or stem.startswith("catalog_")
+        # Find Review tab index
+        review_idx = None
+        for i in range(self.tabs.count()):
+            if self._strip_dot(self.tabs.tabText(i)).lower() == "review":
+                review_idx = i
+                break
+        if review_idx is None:
+            return
+        for i in range(self.tabs.count()):
+            self.tabs.setTabEnabled(i, (i == review_idx) if is_export else True)
+        if is_export:
+            self.tabs.setCurrentIndex(review_idx)
 
     def selected_source_index(self) -> QModelIndex | None:
         sel = self.tree.selectionModel().selectedIndexes()
-        if not sel: return None
+        if not sel:
+            return None
         idx = sel[0]
         if idx.column() != 0:
             idx = self.proxy.index(idx.row(), 0, idx.parent())
@@ -979,19 +1277,30 @@ class CatalogWindow(QMainWindow):
 
     def selected_path(self) -> Path | None:
         sidx = self.selected_source_index()
-        if not sidx or not sidx.isValid(): return None
+        if not sidx or not sidx.isValid():
+            return None
         return Path(self.fs_model.filePath(sidx))
 
-    def is_markdown(self, path: Path) -> bool:
-        return path.is_file() and path.suffix.lower() == ".md"
+    def selected_paths(self) -> list:
+        sel = self.tree.selectionModel().selectedIndexes()
+        if not sel:
+            return []
+        col0 = []
+        for idx in sel:
+            if idx.column() != 0:
+                continue
+            sidx = self.proxy.mapToSource(idx)
+            if sidx.isValid():
+                col0.append(Path(self.fs_model.filePath(sidx)))
+        return sorted(set(col0), key=lambda p: str(p).lower())
 
-    # --- Metadata helpers -------------------------------------------------------
+    # ---------- Metadata helpers -----------------------------------------------
     def add_rev_row(self):
         r = self.rev_table.rowCount()
         self.rev_table.insertRow(r)
-        defaults = ["", today_iso(), "", ""]
+        defaults = ["", today_iso(), "", self._default_owner_for_context()]
         if r == 0:
-            defaults = ["-", today_iso(), "initial release", ""]
+            defaults = ["-", today_iso(), "initial release", self._default_owner_for_context()]
         for c, val in enumerate(defaults):
             self.rev_table.setItem(r, c, QTableWidgetItem(val))
 
@@ -1010,26 +1319,34 @@ class CatalogWindow(QMainWindow):
         if r >= 0:
             self.variant_table.removeRow(r)
 
-    # --- Selection / load -------------------------------------------------------
+    # ---------- Selection / load -----------------------------------------------
     def on_tree_selection(self, *_):
-        # Autosave before switching away
         if self.dirty:
             self.save_from_form(silent=True)
             self._reset_autosave_countdown()
 
         path = self.selected_path()
-        if not path: return
+        if not path:
+            self.update_file_counter()
+            return
         if path.is_dir():
             self.current_path = None
             self.current_folder = path
             self.path_label.setText(f"Folder: {path}")
+            self._toggle_panels(folder_mode=True)
             self.load_folder_meta(path)
-            self.show_file_ui(False)
+            self.update_file_counter()
             return
-        if self.is_markdown(path):
+        if path.is_file() and path.suffix.lower() == ".md":
             self.current_folder = None
+            self._toggle_panels(folder_mode=False)
             self.load_file(path)
-            self.show_file_ui(True)
+            self.update_file_counter()
+
+    def _toggle_panels(self, folder_mode: bool):
+        # Correct version of show_file_ui (without the intentional mistake above)
+        self.tabs.setVisible(not folder_mode)
+        self.folder_panel.setVisible(folder_mode)
 
     def load_folder_meta(self, folder: Path):
         self.suppress_dirty = True
@@ -1057,16 +1374,12 @@ class CatalogWindow(QMainWindow):
         self.current_path = path
         self.path_label.setText(f"File: {path}")
 
-        (fields, rev_rows, variant_items, netlist, partlist_text,
-         cd, ct, da) = self.parse_markdown(text)
+        (fields, rev_rows, variant_items, netlist, partlist_text, cd, ct, da) = self.parse_markdown(text)
 
         self.suppress_dirty = True
-
-        # Intro fields
         for key, _ in FIELD_ORDER:
             self.field_widgets[key].setText(fields.get(key, ""))
 
-        # Revision table
         self.rev_table.setRowCount(0)
         for row in rev_rows:
             rr = (row + [""] * len(REV_HEADERS))[:len(REV_HEADERS)]
@@ -1075,21 +1388,18 @@ class CatalogWindow(QMainWindow):
             for c, val in enumerate(rr):
                 self.rev_table.setItem(r, c, QTableWidgetItem(val))
 
-        # Variant Details
         self.variant_table.setRowCount(0)
         for item in variant_items:
             r = self.variant_table.rowCount()
             self.variant_table.insertRow(r)
             self.variant_table.setItem(r, 0, QTableWidgetItem(item))
 
-        # Sections
         self.netlist_edit.setPlainText(netlist)
         self.partlist_edit.setPlainText(partlist_text)
         self.cd_edit.setPlainText(cd)
         self.ct_edit.setPlainText(ct)
         self.da_edit.setPlainText(da)
 
-        # Raw review
         self.review_edit.blockSignals(True)
         self.review_edit.setPlainText(text)
         self.review_edit.blockSignals(False)
@@ -1098,10 +1408,12 @@ class CatalogWindow(QMainWindow):
         self.suppress_dirty = False
         self._clear_dirty()
         self._reset_autosave_countdown()
-
         self.proxy.refresh_desc(path)
 
-    # --- Parse / Build markdown -------------------------------------------------
+        # Lock tabs if this is an export/aggregate file
+        self._lock_non_review_tabs_if_export(self.current_path)
+
+    # ---------- Parse / Build markdown -----------------------------------------
     def _find_section(self, lines, title: str):
         want = f"## {title}".lower()
         for i, ln in enumerate(lines):
@@ -1114,42 +1426,35 @@ class CatalogWindow(QMainWindow):
         out = []
         n = len(lines)
         while j < n and not lines[j].startswith("## "):
-            out.append(lines[j])
-            j += 1
+            out.append(lines[j]); j += 1
         while out and not out[0].strip(): out.pop(0)
         while out and not out[-1].strip(): out.pop()
         return "\n".join(out)
 
     def _parse_table_at(self, lines, start_idx: int):
-        """Parse a markdown table starting at/after start_idx (skips any divider rows)."""
         rows = []
         if start_idx is None:
             return rows
         j = start_idx + 1
         n = len(lines)
-
-        # find header row
+        # find header
         while j < n and not lines[j].strip().startswith("|"):
             if lines[j].strip().startswith("## "):
                 return rows
             j += 1
         if j >= n:
             return rows
-
-        # skip one or more divider lines following the header
+        # skip divider lines
         j += 1
         while j < n and lines[j].strip().startswith("|") and _is_md_divider_line(lines[j]):
             j += 1
-
-        # consume body (skip any stray divider lines in body)
+        # consume body
         while j < n and lines[j].strip().startswith("|"):
             if _is_md_divider_line(lines[j]):
-                j += 1
-                continue
+                j += 1; continue
             raw = lines[j].strip().strip("|")
             cells = [c.strip() for c in raw.split("|")]
-            rows.append(cells)
-            j += 1
+            rows.append(cells); j += 1
         return rows
 
     def _parse_bulleted_list(self, lines, start_idx: int):
@@ -1176,10 +1481,7 @@ class CatalogWindow(QMainWindow):
         partlist_text = ""
         cd = ct = da = ""
 
-        # Introduction table
         i = 0; n = len(lines)
-        # collect all fields (for optional migration if you add later)
-        all_fields = {}
         while i < n:
             if lines[i].strip().lower().startswith("| field") and "| value" in lines[i].lower():
                 i += 2
@@ -1188,34 +1490,42 @@ class CatalogWindow(QMainWindow):
                     if m:
                         field = m.group("field").strip()
                         value = m.group("value").strip()
-                        all_fields[field] = value
                         if field in fields: fields[field] = value
                     i += 1
                 break
             i += 1
 
-        # Global Revision History
         rhx = self._find_section(lines, "Revision History")
         if rhx is not None:
-            rev_rows = self._parse_table_at(lines, rhx)
+            j = rhx + 1
+            while j < n and not lines[j].strip().startswith("|"):
+                if lines[j].strip().startswith("## "):
+                    j = None; break
+                j += 1
+            if j is not None:
+                j += 1
+                while j < n and lines[j].strip().startswith("|") and _is_md_divider_line(lines[j]):
+                    j += 1
+                while j < n and lines[j].strip().startswith("|"):
+                    if _is_md_divider_line(lines[j]):
+                        j += 1; continue
+                    raw = lines[j].strip().strip("|")
+                    cells = [c.strip() for c in raw.split("|")]
+                    rev_rows.append(cells); j += 1
 
-        # Variant Details
         vdx = self._find_section(lines, "Variant Details")
         if vdx is not None:
             variant_items = self._parse_bulleted_list(lines, vdx)
 
-        # Netlist
         nix = self._find_section(lines, "Netlist")
         if nix is not None:
             netlist = self._read_section_text(lines, nix)
 
-        # Partlist
         pix = self._find_section(lines, "Partlist")
         if pix is not None:
             tmp = self._read_section_text(lines, pix)
             partlist_text = tmp if tmp.strip() else f"| {' | '.join(PARTLIST_HEADERS)} |\n{_divider_for(PARTLIST_HEADERS)}"
 
-        # Narrative sections
         cdx = self._find_section(lines, SECTION_TITLES["cd"])
         if cdx is not None: cd = self._read_section_text(lines, cdx)
         ctx = self._find_section(lines, SECTION_TITLES["ct"])
@@ -1225,10 +1535,7 @@ class CatalogWindow(QMainWindow):
 
         return fields, rev_rows, variant_items, netlist, partlist_text, cd, ct, da
 
-    def build_markdown(self, fields: dict, rev_rows: list, variant_items: list,
-                       netlist: str, partlist_text: str,
-                       cd: str, ct: str, da: str) -> str:
-        # Introduction table
+    def build_markdown(self, fields: dict, rev_rows: list, variant_items: list, netlist: str, partlist_text: str, cd: str, ct: str, da: str) -> str:
         intro_lines = [
             "| Field                  | Value                     |",
             "| ---------------------- | ------------------------- |",
@@ -1236,25 +1543,19 @@ class CatalogWindow(QMainWindow):
         for key, _ in FIELD_ORDER:
             intro_lines.append(f"| {key:<22} | {fields.get(key,'').strip()} |")
 
-        # Build table helper (skip divider-like rows)
         def build_table(headers, rows):
-            out = ["| " + " | ".join(headers) + " |",
-                   _divider_for(headers)]
+            out = ["| " + " | ".join(headers) + " |", _divider_for(headers)]
             for r in rows:
-                if _is_divider_cells([x.strip() for x in r]):
-                    continue
+                if _is_divider_cells([x.strip() for x in r]): continue
                 rr = (r + [""] * len(headers))[:len(headers)]
                 out.append("| " + " | ".join(rr) + " |")
             return "\n".join(out)
 
-        # Variant list to markdown
         def build_variant_list(items):
             items = [it.strip() for it in items if it.strip()]
-            if not items:
-                return "- (none)"
+            if not items: return "- (none)"
             return "\n".join(f"- {it}" for it in items)
 
-        # Partlist default if empty
         ptxt = (partlist_text or "").strip()
         if not ptxt:
             ptxt = f"| {' | '.join(PARTLIST_HEADERS)} |\n{_divider_for(PARTLIST_HEADERS)}"
@@ -1264,10 +1565,8 @@ class CatalogWindow(QMainWindow):
             return [f"## {h}", "", (body if body else "(Click or type to add content…)")]
 
         out = [
-            "# Circuit Metadata",
-            "",
-            f"**Last Updated:** {today_iso()}",
-            "",
+            "# Circuit Metadata", "",
+            f"**Last Updated:** {today_iso()}", "",
             "## Introduction", "",
             "\n".join(intro_lines), "",
             "## Revision History", "",
@@ -1283,15 +1582,11 @@ class CatalogWindow(QMainWindow):
         ]
         return "\n".join(out).rstrip() + "\n"
 
-    # --- Save -------------------------------------------------------------------
+    # ---------- Save ------------------------------------------------------------
     def save_from_form(self, silent: bool = False):
-        """
-        If a file is selected -> save Markdown.
-        If a folder is selected -> save folder JSON.
-        """
         # Save file
-        if self.current_path and self.is_markdown(self.current_path):
-            # Review tab takes precedence when dirty or active
+        if self.current_path and self.current_path.is_file() and self.current_path.suffix.lower() == ".md":
+            # If Review tab active/dirty, save raw text
             if self.review_dirty or self._strip_dot(self.tabs.tabText(self.tabs.currentIndex())) == "Review":
                 raw = self.review_edit.toPlainText()
                 try:
@@ -1299,27 +1594,27 @@ class CatalogWindow(QMainWindow):
                 except Exception as e:
                     self.error("Error", f"Failed to save file:\n{e}"); return
                 if not silent:
-                    self.load_file(self.current_path)  # refresh all views for manual saves
+                    self.load_file(self.current_path)
                 self.review_dirty = False
                 self._clear_dirty()
                 self._reset_autosave_countdown()
-                # if not silent:
-                    # self.info("Saved", "Catalog entry saved from raw Markdown.")
+                self._update_stats_on_save(self.current_path, raw)
                 return
 
-            # Save from structured tabs
+            # Structured save
             fields = {k: w.text().strip() for k, w in self.field_widgets.items()}
 
-            # Revision rows
             rev_rows = []
             for r in range(self.rev_table.rowCount()):
                 row = []
                 for c in range(len(REV_HEADERS)):
                     it = self.rev_table.item(r, c)
                     row.append(it.text().strip() if it else "")
+                # Backfill empty “By” with default owner if blank
+                if len(row) >= 4 and not row[3].strip():
+                    row[3] = self._default_owner_for_context()
                 rev_rows.append(row)
 
-            # Variant items
             variant_items = []
             for r in range(self.variant_table.rowCount()):
                 it = self.variant_table.item(r, 0)
@@ -1333,27 +1628,21 @@ class CatalogWindow(QMainWindow):
             ct = self.ct_edit.toPlainText()
             da = self.da_edit.toPlainText()
 
-            text = self.build_markdown(
-                fields, rev_rows, variant_items,
-                netlist, partlist_text, cd, ct, da
-            )
+            text = self.build_markdown(fields, rev_rows, variant_items, netlist, partlist_text, cd, ct, da)
 
             try:
                 self.current_path.write_text(text, encoding="utf-8")
             except Exception as e:
                 self.error("Error", f"Failed to save file:\n{e}"); return
 
-            # Update raw view silently
             self.review_edit.blockSignals(True)
             self.review_edit.setPlainText(text)
             self.review_edit.blockSignals(False)
             self.review_dirty = False
             self._clear_dirty()
             self._reset_autosave_countdown()
-
             self.proxy.refresh_desc(self.current_path)
-            # if not silent:
-                # self.info("Saved", "Catalog entry saved.")
+            self._update_stats_on_save(self.current_path, text)
             return
 
         # Save folder metadata
@@ -1396,18 +1685,13 @@ class CatalogWindow(QMainWindow):
         if not silent:
             self.info("Save", "Select a folder or a Markdown file to save.")
 
-    # --- Folder metadata / archive / file ops ----------------------------------
+    # ---------- Folder metadata / archive / file ops ---------------------------
     def read_folder_meta(self, folder: Path) -> dict:
         meta_p = folder_meta_path(folder)
         if not meta_p.exists():
             meta = {
-                "TITLE": "",
-                "DESCRIPTION": "",
-                "Summary": "",
-                "Owner": "",
-                "Tags": [],
-                "Created": today_iso(),
-                "Last Updated": today_iso(),
+                "TITLE": "", "DESCRIPTION": "", "Summary": "", "Owner": "",
+                "Tags": [], "Created": today_iso(), "Last Updated": today_iso(),
             }
             try: meta_p.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             except Exception: pass
@@ -1426,21 +1710,13 @@ class CatalogWindow(QMainWindow):
             return meta
         except Exception:
             return {
-                "TITLE": "",
-                "DESCRIPTION": "",
-                "Summary": "",
-                "Owner": "",
-                "Tags": [],
-                "Created": today_iso(),
-                "Last Updated": today_iso(),
+                "TITLE": "", "DESCRIPTION": "", "Summary": "", "Owner": "",
+                "Tags": [], "Created": today_iso(), "Last Updated": today_iso(),
             }
 
     def archive_script_folder(self):
         try:
-            if getattr(sys, 'frozen', False):
-                script_dir = Path(sys.executable).resolve().parent
-            else:
-                script_dir = Path(__file__).resolve().parent
+            script_dir = _script_dir()
         except Exception:
             self.error("Archive", "Could not determine script directory."); return
 
@@ -1470,7 +1746,6 @@ class CatalogWindow(QMainWindow):
         if not path:
             self.info("Open Location", "Select a folder or file first.")
             return
-
         try:
             if platform.system() == "Windows":
                 if path.is_file():
@@ -1502,39 +1777,113 @@ class CatalogWindow(QMainWindow):
             self.warn("Exists", "A file/folder with that name already exists.")
         except Exception as e:
             self.error("Error", f"Failed to create folder:\n{e}")
+        self.update_file_counter()
 
     def create_new_entry(self):
         base = self.selected_path() or self.catalog_root
         if base.is_file(): base = base.parent
-        name, ok = self.ask_text("New Entry", "File name (without extension):")
+
+        suggested = self._next_default_filename()
+        name, ok = self.ask_text("New Entry", "File name (without extension):", default=suggested)
         if not ok or not name.strip(): return
         safe = name.strip()
         if not safe.lower().endswith(".md"): safe += ".md"
         target = base / safe
         if target.exists():
             self.warn("Exists", "A file with that name already exists."); return
+
         try:
-            target.write_text(NEW_ENTRY_TEMPLATE, encoding="utf-8")
+            default_owner = self._default_owner_for_context()
+            target.write_text(_new_entry_template(default_owner), encoding="utf-8")
         except Exception as e:
             self.error("Error", f"Failed to create file:\n{e}"); return
+
+        # Commit counter based on actual created filename
+        self._commit_counter_after_creation(target)
+
         self.load_file(target)
         sidx = self.fs_model.index(str(target))
         if sidx.isValid():
             pidx = self.proxy.mapFromSource(sidx)
             if pidx.isValid(): self.tree.setCurrentIndex(pidx)
+        self.update_file_counter()
 
     def rename_item(self):
-        path = self.selected_path()
-        if not path:
-            self.info("Rename", "Select a file or folder to rename."); return
+        paths = self.selected_paths()
+        if not paths:
+            self.info("Rename", "Select one or more files/folders to rename.")
+            return
 
+        # Batch case
+        if len(paths) >= 2:
+            files = [p for p in paths if p.is_file()]
+            if not files:
+                self.warn("Rename", "Batch rename only supports files. Select files and try again.")
+                return
+
+            base_default = (self.settings.get("file_name_prefix") or "").strip()
+            base, ok = self.ask_text("Batch Rename", "Base prefix for new names (e.g., LM):", default=base_default)
+            if not ok:
+                return
+            base = (base or "").strip()
+
+            start_text, ok = self.ask_text("Batch Rename", "Starting number:", default="1")
+            if not ok:
+                return
+            try:
+                start = max(1, int(start_text.strip()))
+            except Exception:
+                self.warn("Rename", "Starting number must be an integer.")
+                return
+
+            width_text, ok = self.ask_text("Batch Rename", "Number width (zero-padded):", default=str(int(self.settings.get("number_width", 3))))
+            if not ok:
+                return
+            try:
+                width = max(1, int(width_text.strip()))
+            except Exception:
+                self.warn("Rename", "Width must be an integer.")
+                return
+
+            files = sorted(files, key=lambda p: (str(p.parent).lower(), p.name.lower()))
+            i = start
+            errors = []
+            renamed = 0
+
+            for p in files:
+                parent = p.parent
+                ext = p.suffix  # keep original extension
+                new_name = f"{base}{str(i).zfill(width)}{ext}"
+                target = parent / new_name
+                if target.exists():
+                    errors.append(f"Exists: {target}")
+                    i += 1
+                    continue
+                try:
+                    p.rename(target)
+                    self.proxy.refresh_desc(target)
+                    renamed += 1
+                    i += 1
+                except Exception as e:
+                    errors.append(f"{p.name}: {e}")
+
+            self.update_file_counter()
+            if errors:
+                self.warn("Batch Rename", f"Renamed {renamed} item(s).\nSome items failed:\n" + "\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
+            else:
+                self.info("Batch Rename", f"Renamed {renamed} item(s).")
+            return
+
+        # Single-item rename
+        path = paths[0]
         new_name, ok = self.ask_text("Rename", "New name:", default=path.name)
         if not ok or not new_name.strip():
             return
 
         new_path = path.parent / new_name.strip()
         if new_path.exists():
-            self.warn("Exists", "Target name already exists."); return
+            self.warn("Exists", "Target name already exists.")
+            return
 
         try:
             if path.is_dir():
@@ -1543,7 +1892,6 @@ class CatalogWindow(QMainWindow):
 
                 old_meta = new_path / f"{old_folder_name}.json"
                 new_meta = new_path / f"{new_path.name}.json"
-
                 if old_meta.exists():
                     if new_meta.exists():
                         try: old_meta.unlink()
@@ -1574,6 +1922,8 @@ class CatalogWindow(QMainWindow):
         except Exception as e:
             self.error("Error", f"Failed to rename:\n{e}")
 
+        self.update_file_counter()
+
     def delete_item(self):
         path = self.selected_path()
         if not path: return
@@ -1586,14 +1936,12 @@ class CatalogWindow(QMainWindow):
         except Exception as e:
             self.error("Error", f"Failed to delete:\n{e}"); return
         if self.current_path and self.current_path == path:
-            self.current_path = None
-            self.path_label.setText("")
+            self.current_path = None; self.path_label.setText("")
         if self.current_folder and self.current_folder == path:
-            self.current_folder = None
-            self.path_label.setText("")
+            self.current_folder = None; self.path_label.setText("")
+        self.update_file_counter()
 
-# --- Boot ---------------------------------------------------------------------
-
+# ---------- Boot ---------------------------------------------------------------
 def ensure_catalog_root(start_dir: Path | None = None) -> Path:
     root = DEFAULT_CATALOG_DIR if start_dir is None else start_dir
     if not root.exists():
@@ -1616,6 +1964,10 @@ def ensure_catalog_root(start_dir: Path | None = None) -> Path:
     return root
 
 def main():
+    # Ensure settings file exists early
+    if not SETTINGS_PATH.exists():
+        save_settings(load_settings())
+
     app = QApplication(sys.argv)
     app.setStyle(QStyleFactory.create("Fusion"))
 
