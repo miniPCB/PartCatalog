@@ -1,14 +1,15 @@
 {
+  "schematic_folder": "C:/Repos/PartCatalog/catalog/partcatalog/docs",
   "owner_default_name": "Nolan Manteufel",
   "file_name_prefix": "NM",
   "number_width": 3,
   "last_file_counters": {
-    "NM": 14
+    "NM": 15
   },
   "stats": {
-    "files_total": 14,
-    "lines_total": 950,
+    "files_total": 16,
+    "lines_total": 69625,
     "last_saved_path": "C:\\Repos\\PartCatalog\\catalog\\partcatalog\\001\\NM001.md",
-    "last_updated": "2025-09-18T22:24:16"
+    "last_updated": "2025-10-01T18:04:30"
   }
 }

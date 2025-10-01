@@ -1,51 +1,78 @@
 #!/usr/bin/env python3
 """
 Parts Catalog Tool — PyQt5 (Dark-only, Focused Editor v13)
-- Plain-text editors everywhere (no rich text / no pasted colors)
-- Text Zoom: Ctrl+= / Ctrl++ (Zoom In), Ctrl+- (Zoom Out), Ctrl+0 (Reset)
-- File counter in the nav pane footer: "Files in folder | Total"
-- Default revision author:
-    • New Revision rows default the “By” column to:
-        (Global Default Owner Name, if set) else (current folder Owner)
-    • Configurable via Settings & Tools (toolbar)
-- Default new-file name (robust to deletions):
-    • Proposes name = <prefix><number> (zero-padded)
-      number is tracked per-prefix in settings (“last_file_counters”),
-      then incremented until a free filename is found.
-    • Examples: "",3 → "001"; "LM",3 → "LM001"
-    • Configurable via Settings & Tools (prefix + width)
-- High-level Settings file (JSON) next to the script:
-    • stores: owner_default_name, file_name_prefix, number_width, last_file_counters, stats
-    • stats updated on saves (files_total, lines_total across entire repo, last_saved_path, last_updated)
-- Batch Rename:
-    • Ctrl/Cmd-select multiple files in the tree and click “Rename”
-    • Supply base prefix, starting number, and width → renames per-folder, keeps file extensions
-- Settings & Tools (toolbar):
-    • Save Current (same as Ctrl+S)
-    • Export Single File: concatenates all .md files in repository into one .md
-      (always placed at the TOP LEVEL of the catalog root)
-    • Archive (zip of the folder containing this script)
-- Single Save available via Tools dialog and Ctrl+S
-- Metadata tab has subtabs:
-    • Introduction (Title, Part Number, Notes, etc.)
-    • Revision History (global table)
-    • Variant Details (list of items)
-- Editor tabs: Metadata, Netlist (plain), Partlist (plain),
-               Circuit Description (plain), Circuit Theory (plain),
-               Design Analysis (plain), Review (raw Markdown, plain)
-- Autosave + dirty indicator:
-    • Autosaves every N seconds *and* when switching tree selection
-    • Live toolbar countdown: “Autosave in: XXs” (counts only when there are unsaved edits)
-    • “●” on active tab + “•” in window title when unsaved
-- Folder metadata panel fills the right pane when a folder is selected
-- Drag & Drop tree with MOVE support (files and folders), resizable splitter
-- Tree shows Name + Description (files: Title field from Markdown; folders: TITLE from folder JSON)
-- Folder metadata JSON (<Folder>/<Folder>.json) with fields: TITLE, DESCRIPTION (UPPERCASE), Summary, Owner, Tags, Created, Last Updated
-- Archive: zips folder containing this script; archive saved inside as YYYYMMDD_HHMMSS.zip
-- App/window icon uses an emoji (🗂️)
 
-Special behavior:
-- Any file whose name starts with "catlog_" OR "catalog_" will lock all tabs except the Review tab (which stays enabled).
+Revision History (Code)
+-----------------------
+- 2025-10-01 — Schematic PDFs, Viewer Fit, and PDF UX Hardening
+  Author: Nolan Manteufel
+  Description of Change:
+    - Added a new “Schematic” main tab (immediately after “Metadata”).
+      • Each Schematic subtab is created by scanning a configurable folder for PN_*.pdf.
+      • Subtab label = the * portion of PN_*.pdf (e.g., PN_sch.pdf → “sch”).
+      • Uses lazy-load: the PDF file is only rendered when its subtab is first selected.
+    - New Settings field: “Schematic Folder”.
+      • Accepts absolute or relative paths (relative paths resolve against the current file’s folder).
+      • Includes a Browse… button; setting is persisted in parts_catalog_settings.json.
+    - PDF viewer (PyMuPDF-based) improvements:
+      • Wheel scroll (normal), Ctrl + Wheel zoom, left-drag to pan.
+      • On load and window resize, auto “fit-to-width” (not cropped) until the user manually zooms.
+      • Clear diagnostics: error/notice labels always show the full, resolved path attempted.
+      • Hardened lazy-loader to recompute path if the stored property is missing.
+    - Show PDFs in the file tree (read-only behavior):
+      • PDFs appear in the left pane with Description “[PDF document]”.
+      • PDFs cannot be renamed, deleted, dragged, or moved from within the app.
+      • Selecting a PDF does not open any editors; right pane remains non-editable.
+    - Safety: Disabled batch rename (multi-file) entirely to protect external references.
+    - Cleanup: Removed the optional trigger that rebuilt schematic tabs when Revision History table cells changed.
+      • Schematic tabs still rebuild on file load (and optionally on Part Number changes if enabled).
+
+- 2025-09-17 — v13, Initial release
+  Author: Nolan Manteufel
+  Description of Change:
+    Parts Catalog Tool — PyQt5 (Dark-only, Focused Editor v13)
+    - Plain-text editors everywhere (no rich text / no pasted colors)
+    - Text Zoom: Ctrl+= / Ctrl++ (Zoom In), Ctrl+- (Zoom Out), Ctrl+0 (Reset)
+    - File counter in the nav pane footer: "Files in folder | Total"
+    - Default revision author:
+        • New Revision rows default the “By” column to:
+            (Global Default Owner Name, if set) else (current folder Owner)
+        • Configurable via Settings & Tools (toolbar)
+    - Default new-file name (robust to deletions):
+        • Proposes name = <prefix><number> (zero-padded)
+          number is tracked per-prefix in settings (“last_file_counters”),
+          then incremented until a free filename is found.
+        • Examples: "",3 → "001"; "LM",3 → "LM001"
+        • Configurable via Settings & Tools (prefix + width)
+    - High-level Settings file (JSON) next to the script:
+        • stores: owner_default_name, file_name_prefix, number_width, last_file_counters, stats
+        • stats updated on saves (files_total, lines_total across entire repo, last_saved_path, last_updated)
+    - Settings & Tools (toolbar):
+        • Save Current (same as Ctrl+S)
+        • Export Single File: concatenates all .md files in repository into one .md
+          (always placed at the TOP LEVEL of the catalog root)
+        • Archive (zip of the folder containing this script)
+    - Single Save available via Tools dialog and Ctrl+S
+    - Metadata tab has subtabs:
+        • Introduction (Title, Part Number, Notes, etc.)
+        • Revision History (global table)
+        • Variant Details (list of items)
+    - Editor tabs: Metadata, Netlist (plain), Partlist (plain),
+                   Circuit Description (plain), Circuit Theory (plain),
+                   Design Analysis (plain), Review (raw Markdown, plain)
+    - Autosave + dirty indicator:
+        • Autosaves every N seconds *and* when switching tree selection
+        • Live toolbar countdown: “Autosave in: XXs” (counts only when there are unsaved edits)
+        • “●” on active tab + “•” in window title when unsaved
+    - Folder metadata panel fills the right pane when a folder is selected
+    - Drag & Drop tree with MOVE support (files and folders), resizable splitter
+    - Tree shows Name + Description (files: Title field from Markdown; folders: TITLE from folder JSON)
+    - Folder metadata JSON (<Folder>/<Folder>.json) with fields: TITLE, DESCRIPTION (UPPERCASE), Summary, Owner, Tags, Created, Last Updated
+    - Archive: zips folder containing this script; archive saved inside as YYYYMMDD_HHMMSS.zip
+    - App/window icon uses an emoji (🗂️)
+    - Special behavior:
+        • Any file whose name starts with "catlog_" OR "catalog_" will lock all tabs except the Review tab.
+
 """
 
 import sys
@@ -86,6 +113,7 @@ def _script_dir() -> Path:
 SETTINGS_PATH = _script_dir() / "parts_catalog_settings.json"
 
 DEFAULT_SETTINGS = {
+    "schematic_folder": "docs",    # Default subfolder (relative to the current file's folder) for schematic PDFs
     "owner_default_name": "",      # If non-empty, overrides folder Owner for default “By”
     "file_name_prefix": "",        # Prefix for new files (e.g., "LM")
     "number_width": 3,             # Zero-pad width (e.g., 3 → 001)
@@ -196,7 +224,7 @@ def _new_entry_template(default_owner: str) -> str:
 
 | {' | '.join(REV_HEADERS)} |
 {_divider_for(REV_HEADERS)}
-| - | {today_iso()} | initial release | {default_owner} |
+| - | {today_iso()} | Initial release | {default_owner} |
 
 ## Variant Details
 
@@ -223,6 +251,132 @@ def _new_entry_template(default_owner: str) -> str:
 
 (design tradeoffs, margins, component selection rationale, SOA, derating…)
 """).strip() + "\n"
+
+# ---------- PDF Viewer (lazy, multi-page) -------------------------------------
+try:
+    import fitz  # PyMuPDF
+    _HAS_FITZ = True
+except Exception:
+    _HAS_FITZ = False
+
+from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QLabel, QScrollBar
+from PyQt5.QtGui import QImage, QPixmap, QPainter
+from PyQt5.QtCore import Qt, QPoint
+
+class PDFGraphicsView(QGraphicsView):
+    """
+    Minimal multi-page PDF renderer using PyMuPDF.
+    - Renders all pages vertically in a single QGraphicsScene.
+    - Normal wheel scroll; Ctrl + wheel for zoom; left-drag to pan.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pages: list[QGraphicsPixmapItem] = []
+        self._panning = False
+        self._last_pos = QPoint()
+        self._scale = 1.0
+        self._user_zoomed = False  # if True, stop auto-fit-to-width on resize
+
+        self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.NoDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setMouseTracking(True)
+
+    def fit_to_width(self):
+        """Scale so the widest page fits the viewport width."""
+        if not self._pages:
+            return
+        # Width of the widest rendered page (scene units = pixels at current transform=identity)
+        page_width = max(p.pixmap().width() for p in self._pages if p.pixmap() and not p.pixmap().isNull())
+        if page_width <= 0:
+            return
+
+        view_w = max(1, self.viewport().width())
+        # Reset transform and compute uniform scale
+        self.resetTransform()
+        factor = view_w / page_width
+        self._scale = factor
+        self.scale(factor, factor)
+
+        # Scroll to top-left so page isn't “cropped” from the left
+        self.horizontalScrollBar().setValue(self.horizontalScrollBar().minimum())
+        self.verticalScrollBar().setValue(self.verticalScrollBar().minimum())
+
+    def clear(self):
+        self._scene.clear()
+        self._pages.clear()
+        self.resetTransform()
+        self._scale = 1.0
+
+    def load_pdf(self, path: str):
+        self.clear()
+        if not _HAS_FITZ:
+            self._scene.addText("PyMuPDF (fitz) not installed.\n\npip install pymupdf")
+            return
+        try:
+            doc = fitz.open(path)
+        except Exception as e:
+            self._scene.addText(f"Failed to open PDF:\n{path}\n\n{e}")
+            return
+
+        y = 0
+        for i in range(len(doc)):
+            page = doc.load_page(i)
+            # Render at 144 dpi-ish (2x), adjust if you want sharper
+            mat = fitz.Matrix(2, 2)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
+            pm = QPixmap.fromImage(img)
+            item = QGraphicsPixmapItem(pm)
+            item.setPos(0, y)
+            self._scene.addItem(item)
+            self._pages.append(item)
+            y += pm.height() + 12  # vertical gap
+
+        # Fit to page width by default
+        self._user_zoomed = False
+        self.fit_to_width()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self._user_zoomed:
+            self.fit_to_width()
+
+    # Zoom only when Ctrl is pressed
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.ControlModifier:
+            angle = event.angleDelta().y()
+            factor = 1.15 if angle > 0 else 1/1.15
+            self._scale = max(0.1, min(5.0, self._scale * factor))
+            self.scale(factor, factor)
+            self._user_zoomed = True
+        else:
+            super().wheelEvent(event)
+
+    # Left-drag to pan
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._panning = True
+            self._last_pos = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning:
+            delta = event.pos() - self._last_pos
+            self._last_pos = event.pos()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._panning:
+            self._panning = False
+            self.setCursor(Qt.ArrowCursor)
+        super().mouseReleaseEvent(event)
 
 # ---------- Icon helper -------------------------------------------------------
 def make_emoji_icon(emoji: str, px: int = 256) -> QIcon:
@@ -252,8 +406,8 @@ class DescProxyModel(QSortFilterProxyModel):
             return False
         if sm.isDir(idx):
             return True
-        name = sm.fileName(idx)
-        return name.lower().endswith(".md")
+        name = sm.fileName(idx).lower()
+        return name.endswith(".md") or name.endswith(".pdf")
 
     def flags(self, index):
         base = super().flags(index)
@@ -263,8 +417,14 @@ class DescProxyModel(QSortFilterProxyModel):
         sm = self.sourceModel()
         if sm.isDir(sidx):
             return base | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled
-        else:
-            return (base | Qt.ItemIsDragEnabled) & ~Qt.ItemIsDropEnabled
+
+        # Files:
+        name = sm.fileName(sidx).lower()
+        if name.endswith(".pdf"):
+            # Read-only: no drag, no drop
+            return base & ~(Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
+        # .md files can be dragged (to move) but not dropped-onto
+        return (base | Qt.ItemIsDragEnabled) & ~Qt.ItemIsDropEnabled
 
     def supportedDropActions(self):
         return Qt.MoveAction
@@ -425,6 +585,35 @@ class SettingsToolsDialog(QDialog):
         self.width = QSpinBox(self); self.width.setRange(1, 8)
         self.width.setValue(int(settings.get("number_width",3)))
 
+        # Schematic folder (string path; relative or absolute)
+        self.schematic_folder_edit = QLineEdit(self)
+        self.schematic_folder_edit.setPlaceholderText("e.g., docs  (relative to current file’s folder)")
+        self.schematic_folder_edit.setText(settings.get("schematic_folder", "docs"))
+
+        # Add a browse button next to it
+        schem_row = QHBoxLayout()
+        schem_row.addWidget(self.schematic_folder_edit)
+        btn_browse_schem = QPushButton("Browse…", self)
+        def _pick_schematic_dir():
+            # Let user choose a folder; store as absolute. (User may still type a relative path manually.)
+            dlg = QFileDialog(self, "Pick schematic folder")
+            dlg.setFileMode(QFileDialog.Directory)
+            dlg.setOption(QFileDialog.ShowDirsOnly, True)
+            dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+            # Dark theming if available
+            try:
+                apply_windows_dark_titlebar(dlg)
+            except Exception:
+                pass
+            if dlg.exec_() == QFileDialog.Accepted:
+                path = dlg.selectedFiles()[0]
+                if path:
+                    self.schematic_folder_edit.setText(path)
+        btn_browse_schem.clicked.connect(_pick_schematic_dir)
+        schem_row.addWidget(btn_browse_schem)
+
+        sf.addRow("Documents Folder:", schem_row)
+
         sf.addRow("Default Owner Name:", self.owner_default)
         sf.addRow("New File Prefix:", self.prefix)
         sf.addRow("Number Width:", self.width)
@@ -487,6 +676,7 @@ class SettingsToolsDialog(QDialog):
         out["owner_default_name"] = self.owner_default.text().strip()
         out["file_name_prefix"] = self.prefix.text().strip()
         out["number_width"] = int(self.width.value())
+        out["schematic_folder"] = self.schematic_folder_edit.text().strip()
         return out
 
 # ---------- Main Window --------------------------------------------------------
@@ -571,7 +761,7 @@ class CatalogWindow(QMainWindow):
         self.fs_model = QFileSystemModel(self)
         self.fs_model.setReadOnly(False)
         self.fs_model.setRootPath(str(self.catalog_root))
-        self.fs_model.setNameFilters(["*.md"])
+        self.fs_model.setNameFilters(["*.md", "*.pdf"])
         self.fs_model.setNameFilterDisables(False)
         self.fs_model.fileRenamed.connect(self.on_fs_file_renamed)
         try:
@@ -698,6 +888,15 @@ class CatalogWindow(QMainWindow):
 
         meta_v.addWidget(self.meta_inner)
         self.tabs.addTab(meta_tab, "Metadata")
+        # --- Schematic tab (lazy PDF subtabs) ---
+        self.schematic_tab = QWidget(self)
+        schem_v = QVBoxLayout(self.schematic_tab); schem_v.setContentsMargins(0,0,0,0)
+        self.schematic_tabs = QTabWidget(self.schematic_tab)
+        schem_v.addWidget(self.schematic_tabs)
+        self.tabs.addTab(self.schematic_tab, "Documents")
+        # Connect once for lazy loads
+        self.schematic_tabs.currentChanged.connect(self._on_schematic_tab_changed)
+
 
         # Plain text tabs
         net_tab = QWidget(self); net_v = QVBoxLayout(net_tab)
@@ -788,6 +987,87 @@ class CatalogWindow(QMainWindow):
         if dlg.exec_() == QDialog.Accepted:
             self.settings = dlg.result_settings()
             save_settings(self.settings)
+            # If a file is open, rebuild schematic subtabs using the new folder
+            if self.current_path and self.current_path.is_file():
+                self._rebuild_schematic_tabs_from_scan()
+
+    # ---------- Schematic (scan folder for PN_*.pdf) ---------------------------
+    def _resolve_schematic_root(self, base_dir: Path) -> Path:
+        """
+        Resolve the schematic folder based on settings:
+        - If settings["schematic_folder"] is absolute, use it.
+        - Else resolve it relative to the current file's folder.
+        - Default to 'docs' under the file's folder.
+        """
+        cfg = (self.settings.get("schematic_folder") or "").strip()
+        if cfg:
+            p = Path(cfg)
+            if p.is_absolute():
+                return p
+            else:
+                return (base_dir / p).resolve()
+        # default
+        return (base_dir / "docs").resolve()
+
+    def _scan_schematic_pdfs(self, pn: str, base_dir: Path) -> list[tuple[str, Path]]:
+        """
+        Return [(label, pdf_path), ...] matching PN_*.pdf in the schematic folder.
+        label = the '*' part (filename minus 'PN_' and '.pdf').
+        """
+        out: list[tuple[str, Path]] = []
+        if not pn:
+            return out
+        root = self._resolve_schematic_root(base_dir)
+        try:
+            if not root.exists() or not root.is_dir():
+                return out
+            # Strict match on PN_*.pdf
+            for p in sorted(root.glob(f"{pn}_*.pdf")):
+                name = p.name
+                # Expect PN_<label>.pdf
+                label = name[len(pn) + 1 : -4] if name.lower().endswith(".pdf") else name
+                label = label.strip() or "—"
+                out.append((label, p.resolve()))
+        except Exception:
+            pass
+        return out
+
+    def _build_schematic_tabs_from_items(self, items: list[tuple[str, Path]]):
+        """Rebuild schematic subtabs from a list of (label, path). Uses lazy-load."""
+        # Clear old
+        while self.schematic_tabs.count():
+            self.schematic_tabs.removeTab(0)
+
+        if not items:
+            msg = QLabel(
+                "No matching PDFs found.\n"
+                "Make sure 'Part Number' is set and the schematic folder contains files named PN_*.pdf.",
+                self.schematic_tab
+            )
+            msg.setAlignment(Qt.AlignCenter)
+            holder = QWidget(self.schematic_tab); lay = QVBoxLayout(holder); lay.addWidget(msg)
+            self.schematic_tabs.addTab(holder, "—")
+            return
+
+        for label, pdf_path in items:
+            holder = QWidget(self.schematic_tab)
+            lay = QVBoxLayout(holder); lay.setContentsMargins(0,0,0,0)
+            info = QLabel(f"Lazy load: {pdf_path}\n\n(Select this tab to load the PDF.)", holder)
+            info.setAlignment(Qt.AlignCenter)
+            lay.addWidget(info)
+
+            holder.setProperty("pdf_path", str(pdf_path))
+            holder.setProperty("loaded", False)
+            self.schematic_tabs.addTab(holder, label)
+
+    def _rebuild_schematic_tabs_from_scan(self):
+        """Convenience: rebuild schematic tabs for the currently loaded file."""
+        if not self.current_path or not self.current_path.is_file():
+            return
+        pn = (self.field_widgets.get("Part Number").text() or "").strip()
+        base_dir = self.current_path.parent
+        items = self._scan_schematic_pdfs(pn, base_dir)
+        self._build_schematic_tabs_from_items(items)
 
     def export_single_file_dialog_cb(self, out_name: str):
         # Destination is always TOP LEVEL of catalog_root
@@ -1167,6 +1447,19 @@ class CatalogWindow(QMainWindow):
         self.folder_summary.textChanged.connect(self._mark_dirty)
         self.folder_owner.textChanged.connect(self._mark_dirty)
         self.folder_tags.textChanged.connect(self._mark_dirty)
+        # Rebuild schematic subtabs when Part Number changes (optional)
+        if "Part Number" in self.field_widgets:
+            self.field_widgets["Part Number"].textChanged.connect(lambda *_: self._rebuild_schematic_tabs_from_scan())
+
+
+    def _rebuild_schematic_tabs_if_visible(self):
+        # Only rebuild if a file is loaded
+        if not self.current_path:
+            return
+        current_pn = (self.field_widgets.get("Part Number").text() or "").strip()
+        base_dir = self.current_path.parent
+        revs = self._collect_revs_from_table()
+        self._build_schematic_tabs(current_pn, revs, base_dir)
 
     def _on_review_changed(self):
         self.review_dirty = True
@@ -1409,6 +1702,9 @@ class CatalogWindow(QMainWindow):
         self._clear_dirty()
         self._reset_autosave_countdown()
         self.proxy.refresh_desc(path)
+        
+        # Build schematic subtabs by scanning the configured folder for PN_*.pdf
+        self._rebuild_schematic_tabs_from_scan()
 
         # Lock tabs if this is an export/aggregate file
         self._lock_non_review_tabs_if_export(self.current_path)
@@ -1581,6 +1877,122 @@ class CatalogWindow(QMainWindow):
             *block(SECTION_TITLES["da"], da), "",
         ]
         return "\n".join(out).rstrip() + "\n"
+    # ---------- Schematic (PDF) helpers ---------------------------------------
+    def _collect_revs_from_table(self) -> list[str]:
+        """Return ordered, de-duplicated list of Rev column values (non-empty)."""
+        seen = set()
+        revs = []
+        for r in range(self.rev_table.rowCount()):
+            it = self.rev_table.item(r, 0)
+            rev = (it.text().strip() if it else "")
+            if rev and rev not in seen:
+                seen.add(rev)
+                revs.append(rev)
+        return revs
+
+    def _build_schematic_tabs(self, pn: str, revs: list[str], base_dir: Path):
+        """Rebuild the schematic sub-tabs based on PN and revision list."""
+        # Clear old tabs
+        while self.schematic_tabs.count():
+            self.schematic_tabs.removeTab(0)
+
+        if not pn:
+            msg = QLabel("Part Number is empty.\nPopulate Introduction → Part Number.", self.schematic_tab)
+            msg.setAlignment(Qt.AlignCenter)
+            holder = QWidget(self.schematic_tab); lay = QVBoxLayout(holder); lay.addWidget(msg)
+            self.schematic_tabs.addTab(holder, "—")
+            return
+
+        if not revs:
+            msg = QLabel("No revisions found.\nAdd rows in Metadata → Revision History.", self.schematic_tab)
+            msg.setAlignment(Qt.AlignCenter)
+            holder = QWidget(self.schematic_tab); lay = QVBoxLayout(holder); lay.addWidget(msg)
+            self.schematic_tabs.addTab(holder, "—")
+            return
+
+        docs_dir = base_dir / "docs"
+        for rev in revs:
+            pdf_name = f"{pn}_{rev}.pdf"
+            pdf_path = (docs_dir / pdf_name).resolve()
+
+            # Lazy placeholder
+            holder = QWidget(self.schematic_tab)
+            lay = QVBoxLayout(holder); lay.setContentsMargins(0,0,0,0)
+            info = QLabel(f"Lazy load: {pdf_path}\n\n(Select this tab to load the PDF.)", holder)
+            info.setAlignment(Qt.AlignCenter)
+            lay.addWidget(info)
+
+            holder.setProperty("pdf_path", str(pdf_path))
+            holder.setProperty("loaded", False)
+            self.schematic_tabs.addTab(holder, rev)
+
+    def _on_schematic_tab_changed(self, idx: int):
+        """Lazy-load the PDF viewer when a subtab is first selected."""
+        if idx < 0:
+            return
+
+        w = self.schematic_tabs.widget(idx)
+        if w is None:
+            return
+
+        if w.property("loaded"):
+            return
+
+        # 1) Try to get the path from the tab's stored property
+        pdf_path = w.property("pdf_path")
+        pdf_path = str(pdf_path) if pdf_path else ""
+
+        # 2) If missing/empty, RECOMPUTE from Settings + PN + tab label
+        if not pdf_path:
+            try:
+                label = self.schematic_tabs.tabText(idx).strip()
+                pn = (self.field_widgets.get("Part Number").text() or "").strip()
+                base_dir = self.current_path.parent if self.current_path else self.catalog_root
+                root = self._resolve_schematic_root(base_dir)
+                candidate = root / f"{pn}_{label}.pdf"
+                pdf_path = str(candidate.resolve())
+            except Exception:
+                pdf_path = ""
+
+        # Clear placeholder widgets
+        layout = w.layout()
+        for i in reversed(range(layout.count())):
+            item = layout.takeAt(i)
+            if item and item.widget():
+                item.widget().deleteLater()
+
+        # Always show the computed path (diagnostic)
+        if not pdf_path:
+            msg = QLabel(
+                "PDF not found (empty path).\n\n"
+                "Tip: Check Introduction → Part Number and Settings → Schematic Folder.",
+                w
+            )
+            msg.setAlignment(Qt.AlignCenter)
+            layout.addWidget(msg)
+            w.setProperty("loaded", True)
+            return
+
+        # Load or show error messages with FULL path
+        if not _HAS_FITZ:
+            msg = QLabel(f"PyMuPDF (fitz) not installed.\n\npip install pymupdf\n\nPath:\n{pdf_path}", w)
+            msg.setAlignment(Qt.AlignCenter)
+            layout.addWidget(msg)
+            w.setProperty("loaded", True)
+            return
+
+        if not os.path.exists(pdf_path):
+            msg = QLabel(f"PDF not found:\n{pdf_path}", w)
+            msg.setAlignment(Qt.AlignCenter)
+            layout.addWidget(msg)
+            w.setProperty("loaded", True)
+            return
+
+        # Success → render
+        view = PDFGraphicsView(w)
+        layout.addWidget(view)
+        view.load_pdf(pdf_path)
+        w.setProperty("loaded", True)
 
     # ---------- Save ------------------------------------------------------------
     def save_from_form(self, silent: bool = False):
@@ -1816,63 +2228,66 @@ class CatalogWindow(QMainWindow):
 
         # Batch case
         if len(paths) >= 2:
-            files = [p for p in paths if p.is_file()]
-            if not files:
-                self.warn("Rename", "Batch rename only supports files. Select files and try again.")
-                return
-
-            base_default = (self.settings.get("file_name_prefix") or "").strip()
-            base, ok = self.ask_text("Batch Rename", "Base prefix for new names (e.g., LM):", default=base_default)
-            if not ok:
-                return
-            base = (base or "").strip()
-
-            start_text, ok = self.ask_text("Batch Rename", "Starting number:", default="1")
-            if not ok:
-                return
-            try:
-                start = max(1, int(start_text.strip()))
-            except Exception:
-                self.warn("Rename", "Starting number must be an integer.")
-                return
-
-            width_text, ok = self.ask_text("Batch Rename", "Number width (zero-padded):", default=str(int(self.settings.get("number_width", 3))))
-            if not ok:
-                return
-            try:
-                width = max(1, int(width_text.strip()))
-            except Exception:
-                self.warn("Rename", "Width must be an integer.")
-                return
-
-            files = sorted(files, key=lambda p: (str(p.parent).lower(), p.name.lower()))
-            i = start
-            errors = []
-            renamed = 0
-
-            for p in files:
-                parent = p.parent
-                ext = p.suffix  # keep original extension
-                new_name = f"{base}{str(i).zfill(width)}{ext}"
-                target = parent / new_name
-                if target.exists():
-                    errors.append(f"Exists: {target}")
-                    i += 1
-                    continue
-                try:
-                    p.rename(target)
-                    self.proxy.refresh_desc(target)
-                    renamed += 1
-                    i += 1
-                except Exception as e:
-                    errors.append(f"{p.name}: {e}")
-
-            self.update_file_counter()
-            if errors:
-                self.warn("Batch Rename", f"Renamed {renamed} item(s).\nSome items failed:\n" + "\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
-            else:
-                self.info("Batch Rename", f"Renamed {renamed} item(s).")
+            self.warn("Rename Disabled",
+                      "Batch rename has been disabled to prevent breaking external references.")
             return
+            # files = [p for p in paths if p.is_file()]
+            # if not files:
+            #     self.warn("Rename", "Batch rename only supports files. Select files and try again.")
+            #     return
+
+            # base_default = (self.settings.get("file_name_prefix") or "").strip()
+            # base, ok = self.ask_text("Batch Rename", "Base prefix for new names (e.g., LM):", default=base_default)
+            # if not ok:
+            #     return
+            # base = (base or "").strip()
+
+            # start_text, ok = self.ask_text("Batch Rename", "Starting number:", default="1")
+            # if not ok:
+            #     return
+            # try:
+            #     start = max(1, int(start_text.strip()))
+            # except Exception:
+            #     self.warn("Rename", "Starting number must be an integer.")
+            #     return
+
+            # width_text, ok = self.ask_text("Batch Rename", "Number width (zero-padded):", default=str(int(self.settings.get("number_width", 3))))
+            # if not ok:
+            #     return
+            # try:
+            #     width = max(1, int(width_text.strip()))
+            # except Exception:
+            #     self.warn("Rename", "Width must be an integer.")
+            #     return
+
+            # files = sorted(files, key=lambda p: (str(p.parent).lower(), p.name.lower()))
+            # i = start
+            # errors = []
+            # renamed = 0
+
+            # for p in files:
+            #     parent = p.parent
+            #     ext = p.suffix  # keep original extension
+            #     new_name = f"{base}{str(i).zfill(width)}{ext}"
+            #     target = parent / new_name
+            #     if target.exists():
+            #         errors.append(f"Exists: {target}")
+            #         i += 1
+            #         continue
+            #     try:
+            #         p.rename(target)
+            #         self.proxy.refresh_desc(target)
+            #         renamed += 1
+            #         i += 1
+            #     except Exception as e:
+            #         errors.append(f"{p.name}: {e}")
+
+            # self.update_file_counter()
+            # if errors:
+            #     self.warn("Batch Rename", f"Renamed {renamed} item(s).\nSome items failed:\n" + "\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
+            # else:
+            #     self.info("Batch Rename", f"Renamed {renamed} item(s).")
+            # return
 
         # Single-item rename
         path = paths[0]
