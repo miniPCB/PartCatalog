@@ -245,34 +245,6 @@ def git_push(repo_root: Path, branch: str) -> None:
     if rc == 0 and "origin" in remotes.splitlines():
         _git(repo_root, "push", "origin", f"HEAD:{branch}")
 
-# ---------- Background Git queue (non-blocking) -------------------------------
-class _GitBg:
-    """Serializes Git tasks off the UI thread."""
-    def __init__(self, repo_root: Path, ui_post: callable):
-        self.repo_root = repo_root
-        self._q: "queue.Queue[callable]" = queue.Queue()
-        self._ui_post = ui_post
-        t = threading.Thread(target=self._loop, daemon=True)
-        t.start()
-
-    def _loop(self):
-        while True:
-            fn = self._q.get()
-            try:
-                fn()
-            except Exception:
-                pass
-            finally:
-                self._q.task_done()
-
-    def submit(self, fn: callable):
-        self._q.put(fn)
-
-    def ui(self, fn: callable):
-        # Post a callable back to the Qt UI thread
-        from PyQt5.QtCore import QTimer
-        QTimer.singleShot(0, fn)
-
 # ---------- App data model constants ------------------------------------------
 FIELD_ORDER = [
     ("Title", "Click or tap here to enter text."),
