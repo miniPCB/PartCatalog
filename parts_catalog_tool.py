@@ -124,7 +124,7 @@ DEFAULT_SETTINGS = {
     "last_file_counters": {},      # per-prefix counters, e.g., {"": 7, "LM": 12}
     "stats": {
         "files_total": 0,          # *.md files across repository
-        "lines_total": 0,          # lines across ALL files in the repository
+        "lines_total": 0,          # lines across text files in the repository (.md, .json, .py, etc.)
         "last_saved_path": "",
         "last_updated": ""
     },
@@ -721,7 +721,7 @@ class SettingsToolsDialog(QDialog):
         stats = settings.get("stats", {})
         self.stats_label = QLabel(
             f"Files Total (*.md): {stats.get('files_total',0)} | "
-            f"Lines in Repository (all files): {stats.get('lines_total',0)}\n"
+            f"Lines in Repository (text files): {stats.get('lines_total',0)}\n"
             f"Last Saved: {stats.get('last_saved_path','')} @ {stats.get('last_updated','')}",
             self
         )
@@ -1390,14 +1390,38 @@ class CatalogWindow(QMainWindow):
             return
 
     def _count_repo_lines(self) -> int:
+        """Count lines only in text files, skipping VCS/venv/build dirs and huge files."""
+        text_exts = {
+            ".md", ".txt", ".json", ".py", ".yml", ".yaml", ".ini", ".cfg", ".toml",
+            ".csv", ".bat", ".ps1"
+        }
+        skip_dirs = {
+            ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
+            ".ruff_cache", "node_modules", "build", "dist", ".venv", "venv"
+        }
+        max_file_bytes = 2_000_000  # skip unusually large files
+
         total = 0
-        for p in self._iter_repo_files(self.catalog_root):
-            try:
-                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-                    for _ in fh:
-                        total += 1
-            except Exception:
-                continue
+        for root, dirnames, files in os.walk(self.catalog_root):
+            # Prune directories in-place to avoid descending into them
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in skip_dirs and not d.startswith(".")  # skip hidden dirs too
+            ]
+            for name in files:
+                p = Path(root) / name
+                if p.suffix.lower() not in text_exts:
+                    continue
+                try:
+                    st = p.stat()
+                    if st.st_size > max_file_bytes:
+                        continue
+                    with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                        for _ in fh:
+                            total += 1
+                except Exception:
+                    # ignore unreadable files
+                    continue
         return total
 
     def _update_stats_on_save(self, path: Path, text: str):
