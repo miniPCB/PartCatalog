@@ -84,22 +84,24 @@ import re
 import tempfile
 import subprocess
 import platform
+from typing import Optional
+import shlex
+import threading, queue
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QSortFilterProxyModel, QModelIndex, QTimer
 from PyQt5.QtGui import QKeySequence, QIcon, QPixmap, QPainter, QFont
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QFileSystemModel, QTreeView, QToolBar, QAction, QFileDialog,
+    QFileSystemModel, QTreeView, QToolBar, QFileDialog,
     QInputDialog, QMessageBox, QLabel, QAbstractItemView,
     QLineEdit, QHeaderView, QPushButton, QSpacerItem, QSizePolicy,
     QGroupBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QStyleFactory, QStyledItemDelegate, QFormLayout, QPlainTextEdit,
     QDialog, QDialogButtonBox, QSpinBox
 )
+from PyQt5.QtWidgets import QAction as QtAction
 
-APP_TITLE = "Parts Catalog Tool"
-DEFAULT_CATALOG_DIR = Path.cwd() / "catalog"
 
 # ---------- Settings (high-level app config) -----------------------------------
 def _script_dir() -> Path:
@@ -110,6 +112,8 @@ def _script_dir() -> Path:
     except Exception:
         return Path.cwd()
 
+APP_TITLE = "Parts Catalog Tool"
+DEFAULT_CATALOG_DIR = _script_dir()
 SETTINGS_PATH = _script_dir() / "parts_catalog_settings.json"
 
 DEFAULT_SETTINGS = {
@@ -123,7 +127,11 @@ DEFAULT_SETTINGS = {
         "lines_total": 0,          # lines across ALL files in the repository
         "last_saved_path": "",
         "last_updated": ""
-    }
+    },
+    "git_remote_url": "",              # e.g., "git@github.com:org/repo.git" (SSH recommended)
+    "git_branch": "main",              # default branch to pull/push
+    "auto_push_delay_seconds": 60,     # countdown refreshed after each save
+    "show_debug_console": True         
 }
 
 def load_settings() -> dict:
@@ -159,6 +167,111 @@ def save_settings(s: dict):
         SETTINGS_PATH.write_text(json.dumps(out, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+# ---------- Git helpers (no UI) -----------------------------------------------
+def _run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
+    _dbg(f"GIT RUN: {' '.join(shlex.quote(x) for x in cmd)}  (cwd={cwd})")
+    try:
+        env = os.environ.copy()
+        env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        env.setdefault(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new"
+        )
+        p = subprocess.Popen(
+            cmd, cwd=str(cwd),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env
+        )
+        out, err = p.communicate()
+        rc = p.returncode
+        _dbg(f"GIT EXIT {rc} | out: {_clip(out)} | err: {_clip(err)}")
+        return rc, (out or "").strip(), (err or "").strip()
+    except Exception as e:
+        _dbg(f"GIT EXC: {e}")
+        return 1, "", str(e)
+
+def _git(cwd: Path, *args: str) -> tuple[int, str, str]:
+    _dbg(f"GIT: git {' '.join(args)}")
+    return _run(["git", *args], cwd)
+
+def ensure_git_repo(repo_root: Path, settings: dict) -> None:
+    _dbg(f"Ensure repo at: {repo_root}")
+    if not (repo_root / ".git").exists():
+        _dbg("Repo not initialized → git init")
+        _git(repo_root, "init")
+    rc, out, _ = _git(repo_root, "symbolic-ref", "--short", "HEAD")
+    if rc != 0:
+        branch = (settings.get("git_branch") or "main").strip() or "main"
+        _git(repo_root, "checkout", "-b", branch)
+        _dbg(f"Ensure current branch = {(settings.get('git_branch') or 'main')}")
+    remote = os.environ.get("PARTS_CATALOG_GIT_REMOTE") or (settings.get("git_remote_url") or "").strip()
+    if remote:
+        rc, remotes, _ = _git(repo_root, "remote")
+        rems = remotes.splitlines() if rc == 0 else []
+        if "origin" not in rems:
+            _git(repo_root, "remote", "add", "origin", remote)
+        else:
+            _git(repo_root, "remote", "set-url", "origin", remote)
+
+def git_pull(repo_root: Path, branch: str) -> None:
+    rc, remotes, _ = _git(repo_root, "remote")
+    if rc == 0 and "origin" in remotes.splitlines():
+        _git(repo_root, "fetch", "origin", branch)
+        _git(repo_root, "merge", f"origin/{branch}")
+
+def _highest_rev_from_table(rev_table) -> str:
+    try:
+        rows = rev_table.rowCount()
+        for r in range(rows - 1, -1, -1):
+            it = rev_table.item(r, 0)
+            val = (it.text().strip() if it else "")
+            if val:
+                return val
+    except Exception:
+        pass
+    return "-"
+
+def git_commit_all(repo_root: Path, message: str) -> bool:
+    _git(repo_root, "add", "-A")
+    rc, _, _ = _git(repo_root, "diff", "--cached", "--quiet")
+    if rc == 0:
+        return False
+    rc, _, _ = _git(repo_root, "commit", "-m", message)
+    return rc == 0
+
+def git_push(repo_root: Path, branch: str) -> None:
+    rc, remotes, _ = _git(repo_root, "remote")
+    if rc == 0 and "origin" in remotes.splitlines():
+        _git(repo_root, "push", "origin", f"HEAD:{branch}")
+
+# ---------- Background Git queue (non-blocking) -------------------------------
+class _GitBg:
+    """Serializes Git tasks off the UI thread."""
+    def __init__(self, repo_root: Path, ui_post: callable):
+        self.repo_root = repo_root
+        self._q: "queue.Queue[callable]" = queue.Queue()
+        self._ui_post = ui_post
+        t = threading.Thread(target=self._loop, daemon=True)
+        t.start()
+
+    def _loop(self):
+        while True:
+            fn = self._q.get()
+            try:
+                fn()
+            except Exception:
+                pass
+            finally:
+                self._q.task_done()
+
+    def submit(self, fn: callable):
+        self._q.put(fn)
+
+    def ui(self, fn: callable):
+        # Post a callable back to the Qt UI thread
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(0, fn)
 
 # ---------- App data model constants ------------------------------------------
 FIELD_ORDER = [
@@ -613,6 +726,16 @@ class SettingsToolsDialog(QDialog):
         schem_row.addWidget(btn_browse_schem)
 
         sf.addRow("Documents Folder:", schem_row)
+        self.git_remote = QLineEdit(self); self.git_remote.setPlaceholderText("git@github.com:org/repo.git (SSH recommended)")
+        self.git_remote.setText(settings.get("git_remote_url",""))
+
+        self.git_branch = QLineEdit(self); self.git_branch.setText(settings.get("git_branch","main"))
+
+        self.push_delay = QSpinBox(self); self.push_delay.setRange(5, 900); self.push_delay.setValue(int(settings.get("auto_push_delay_seconds",60)))
+
+        sf.addRow("Git Remote (origin):", self.git_remote)
+        sf.addRow("Git Branch:", self.git_branch)
+        sf.addRow("Push Delay (sec):", self.push_delay)
 
         sf.addRow("Default Owner Name:", self.owner_default)
         sf.addRow("New File Prefix:", self.prefix)
@@ -673,11 +796,79 @@ class SettingsToolsDialog(QDialog):
 
     def result_settings(self) -> dict:
         out = self.settings.copy()
+        out["git_remote_url"] = self.git_remote.text().strip()
+        out["git_branch"] = self.git_branch.text().strip() or "main"
+        out["auto_push_delay_seconds"] = int(self.push_delay.value())
         out["owner_default_name"] = self.owner_default.text().strip()
         out["file_name_prefix"] = self.prefix.text().strip()
         out["number_width"] = int(self.width.value())
         out["schematic_folder"] = self.schematic_folder_edit.text().strip()
         return out
+
+# ---------- Background Git queue (non-blocking) -------------------------------
+class _GitBg:
+    """Serializes Git tasks off the UI thread."""
+    def __init__(self, repo_root: Path, ui_post: callable):
+        self.repo_root = repo_root
+        self._q: "queue.Queue[callable]" = queue.Queue()
+        self._ui_post = ui_post
+        t = threading.Thread(target=self._loop, daemon=True)
+        t.start()
+
+    def _loop(self):
+        while True:
+            fn = self._q.get()
+            try:
+                fn()
+            except Exception:
+                pass
+            finally:
+                self._q.task_done()
+
+    def submit(self, fn: callable):
+        self._q.put(fn)
+
+    # helpers to marshal UI updates safely
+    def ui(self, fn: callable):
+        self._ui_post(fn)
+
+# ---------- Debug logging (thread-safe) ---------------------------------------
+def _ts():
+    import datetime as _dt
+    return _dt.datetime.now().strftime("%H:%M:%S")
+
+class _UILogger:
+    """Append debug lines into a QPlainTextEdit from any thread."""
+    def __init__(self, post_to_ui_callable, append_fn_callable):
+        self._post = post_to_ui_callable
+        self._append = append_fn_callable
+
+    def log(self, msg: str):
+        line = f"[{_ts()}] {msg}"
+        try:
+            # Marshal to UI thread
+            self._post(lambda: self._append(line))
+        except Exception:
+            pass
+
+# Global debug hook used by git helpers (safe no-op if unset)
+_DBG_HOOK = None
+
+def set_global_debug_logger(fn):
+    """Register a callable(str) used by helpers for debug output."""
+    global _DBG_HOOK
+    _DBG_HOOK = fn
+
+def _dbg(msg: str):
+    try:
+        if _DBG_HOOK:
+            _DBG_HOOK(msg)
+    except Exception:
+        pass
+
+def _clip(s: str, limit: int = 600) -> str:
+    s = (s or "")
+    return (s if len(s) <= limit else s[:limit] + " …(trunc)")
 
 # ---------- Main Window --------------------------------------------------------
 class CatalogWindow(QMainWindow):
@@ -714,35 +905,35 @@ class CatalogWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
 
-        act_new_entry = QAction("🧩 New Entry", self);  act_new_entry.triggered.connect(self.create_new_entry);  tb.addAction(act_new_entry)
-        act_new_folder = QAction("🗂️ New Folder", self); act_new_folder.triggered.connect(self.create_new_folder); tb.addAction(act_new_folder)
-        act_rename     = QAction("✏️ Rename", self);     act_rename.triggered.connect(self.rename_item);           tb.addAction(act_rename)
-        act_delete     = QAction("🗑️ Delete", self);     act_delete.triggered.connect(self.delete_item);           tb.addAction(act_delete)
+        act_new_entry = QtAction("🧩 New Entry", self);  act_new_entry.triggered.connect(self.create_new_entry);  tb.addAction(act_new_entry)
+        act_new_folder = QtAction("🗂️ New Folder", self); act_new_folder.triggered.connect(self.create_new_folder); tb.addAction(act_new_folder)
+        act_rename     = QtAction("✏️ Rename", self);     act_rename.triggered.connect(self.rename_item);           tb.addAction(act_rename)
+        act_delete     = QtAction("🗑️ Delete", self);     act_delete.triggered.connect(self.delete_item);           tb.addAction(act_delete)
 
         tb.addSeparator()
 
-        act_open_loc = QAction("📂 Open Location", self)
+        act_open_loc = QtAction("📂 Open Location", self)
         act_open_loc.setToolTip("Open the selected folder (or the folder containing the selected file) in your file manager")
         act_open_loc.triggered.connect(self.open_file_location)
         tb.addAction(act_open_loc)
 
         # Save and Archive live in Settings & Tools; keep Ctrl+S here:
-        self.act_save = QAction("Save (Ctrl+S)", self)
+        self.act_save = QtAction("Save (Ctrl+S)", self)
         self.act_save.setShortcut(QKeySequence.Save)
         self.act_save.triggered.connect(self.save_from_form)
         self.addAction(self.act_save)
 
         # Settings & Tools
         tb.addSeparator()
-        self.act_settings_tools = QAction("⚙️ Settings & Tools", self)
+        self.act_settings_tools = QtAction("⚙️ Settings & Tools", self)
         self.act_settings_tools.triggered.connect(self.open_settings_tools)
         tb.addAction(self.act_settings_tools)
 
         # Zoom actions
         tb.addSeparator()
-        self.act_zoom_in = QAction("Zoom In", self)
-        self.act_zoom_out = QAction("Zoom Out", self)
-        self.act_zoom_reset = QAction("Reset Zoom", self)
+        self.act_zoom_in = QtAction("Zoom In", self)
+        self.act_zoom_out = QtAction("Zoom Out", self)
+        self.act_zoom_reset = QtAction("Reset Zoom", self)
         self.act_zoom_in.setShortcuts([QKeySequence("Ctrl++"), QKeySequence("Ctrl+=")])
         self.act_zoom_out.setShortcut(QKeySequence("Ctrl+-"))
         self.act_zoom_reset.setShortcut(QKeySequence("Ctrl+0"))
@@ -756,6 +947,19 @@ class CatalogWindow(QMainWindow):
         self.autosave_label = QLabel("Autosave in: —", self)
         self.autosave_label.setStyleSheet("color:#A0A6AD; padding: 0 6px;")
         tb.addWidget(self.autosave_label)
+
+        # Post-to-UI helper (uses Qt event loop)
+        self._ui_post = lambda fn: QTimer.singleShot(0, fn)
+        self._gitbg = _GitBg(self.catalog_root, self._ui_post)
+
+        # Push countdown state + label
+        self.git_push_delay_s = int(self.settings.get("auto_push_delay_seconds", 60))
+        self.git_push_remaining_s: Optional[int] = None
+        self._push_inflight = False
+
+        self.push_label = QLabel("Sync push in: —", self)
+        self.push_label.setStyleSheet("color:#A0A6AD; padding: 0 6px;")
+        tb.addWidget(self.push_label)
 
         # File system model / proxy
         self.fs_model = QFileSystemModel(self)
@@ -772,11 +976,13 @@ class CatalogWindow(QMainWindow):
         self.proxy = DescProxyModel(self)
         self.proxy.setSourceModel(self.fs_model)
 
-        # Left: Tree + footer counter
+        # ===== LEFT PANE: tree + debug console + footer =====
         left_container = QWidget(self)
         left_v = QVBoxLayout(left_container)
-        left_v.setContentsMargins(0, 0, 0, 0); left_v.setSpacing(4)
+        left_v.setContentsMargins(0, 0, 0, 0)
+        left_v.setSpacing(4)
 
+        # --- Tree ---
         self.tree = QTreeView(self)
         self.tree.setModel(self.proxy)
         self.tree.setItemDelegate(SlimLineEditDelegate(self.tree))
@@ -797,20 +1003,93 @@ class CatalogWindow(QMainWindow):
         self.tree.setDragDropMode(QAbstractItemView.DragDrop)
         self.tree.setDragDropOverwriteMode(False)
 
-        # Multi-select for batch rename
+        # Multi-select (batch rename is disabled but selection is useful)
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
         self.tree.selectionModel().selectionChanged.connect(self.on_tree_selection)
 
+        # Add the tree first
         left_v.addWidget(self.tree, 1)
 
+        # --- Debug console (under tree) ---
+        # (QPlainTextEdit is already imported at top; no extra import needed here.)
+        self.debug_console = QPlainTextEdit(self)
+        self.debug_console.setReadOnly(True)
+        # allow selecting + copying while still read-only
+        self.debug_console.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+        )
+        self.debug_console.setMaximumBlockCount(2000)  # keep memory bounded
+        self.debug_console.setPlaceholderText("Debug console… (Git + app messages)")
+        self.debug_console.setStyleSheet(
+            "QPlainTextEdit { background:#15171A; color:#B8C1CC; border:1px solid #3A3F44; }"
+        )
+        self.debug_console.setVisible(bool(self.settings.get("show_debug_console", True)))
+        self.debug_console.setFixedHeight(140)
+
+        def _append_debug_line(s: str):
+            self.debug_console.appendPlainText(s)
+
+        # Post-to-UI helper for logger (uses singleShot)
+        self._ui_post_for_log = lambda fn: QTimer.singleShot(0, fn)
+        self._logger = _UILogger(self._ui_post_for_log, _append_debug_line)
+        set_global_debug_logger(self.debug)
+
+        # Add console under the tree
+        left_v.addWidget(self.debug_console, 0)
+        
+        # --- Debug console actions (copy/copy-all/save/clear)
+        from PyQt5.QtWidgets import QAction
+
+        def _dbg_copy_all():
+            self.debug_console.selectAll()
+            self.debug_console.copy()
+            cur = self.debug_console.textCursor()
+            cur.movePosition(cur.End)
+            self.debug_console.setTextCursor(cur)
+
+        def _dbg_save():
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save Debug Log", "debug_log.txt",
+                "Text Files (*.txt);;All Files (*)"
+            )
+            if path:
+                try:
+                    Path(path).write_text(self.debug_console.toPlainText(), encoding="utf-8")
+                    self.statusBar().showMessage(f"Saved log → {path}", 3000)
+                except Exception as e:
+                    self.error("Save Log", f"Failed to save log:\n{e}")
+
+        # Context menu
+        self.debug_console.setContextMenuPolicy(Qt.CustomContextMenu)
+        def _dbg_menu(pos):
+            menu = self.debug_console.createStandardContextMenu()
+            menu.addSeparator()
+            act_copy_all = QtAction("Copy All", menu); act_copy_all.triggered.connect(_dbg_copy_all); menu.addAction(act_copy_all)
+            act_save = QtAction("Save Log…", menu); act_save.triggered.connect(_dbg_save); menu.addAction(act_save)
+            act_clear = QtAction("Clear Log", menu); act_clear.triggered.connect(self.debug_console.clear); menu.addAction(act_clear)
+            menu.exec_(self.debug_console.mapToGlobal(pos))
+        self.debug_console.customContextMenuRequested.connect(_dbg_menu)
+
+        # Optional toolbar buttons
+        act_dbg_copy = QtAction("Copy", self); act_dbg_copy.setShortcut(QKeySequence.Copy); act_dbg_copy.triggered.connect(self.debug_console.copy)
+        act_dbg_copy_all = QtAction("Copy All", self); act_dbg_copy_all.setShortcut(QKeySequence("Ctrl+Shift+C")); act_dbg_copy_all.triggered.connect(_dbg_copy_all)
+        act_dbg_save = QtAction("Save Log…", self); act_dbg_save.setShortcut(QKeySequence("Ctrl+Shift+S")); act_dbg_save.triggered.connect(_dbg_save)
+        act_dbg_clear = QtAction("Clear Log", self); act_dbg_clear.setShortcut(QKeySequence("Ctrl+Shift+L")); act_dbg_clear.triggered.connect(self.debug_console.clear)
+        tb.addSeparator(); tb.addAction(act_dbg_copy); tb.addAction(act_dbg_copy_all); tb.addAction(act_dbg_save); tb.addAction(act_dbg_clear)
+
+
+        # --- Footer (file counters) ---
         footer = QWidget(self)
         footer_h = QHBoxLayout(footer)
-        footer_h.setContentsMargins(8, 4, 8, 4); footer_h.setSpacing(6)
+        footer_h.setContentsMargins(8, 4, 8, 4)
+        footer_h.setSpacing(6)
         self.counter_label = QLabel("Files in folder: 0 | Total: 0", self)
         self.counter_label.setStyleSheet("color:#CFCFCF;")
-        footer_h.addWidget(self.counter_label); footer_h.addStretch(1)
+        footer_h.addWidget(self.counter_label)
+        footer_h.addStretch(1)
         left_v.addWidget(footer, 0)
+        # ===== end LEFT PANE =====
 
         # Right container (path label + folder panel + tabs)
         right_container = QWidget(self); right_layout = QVBoxLayout(right_container)
@@ -950,6 +1229,25 @@ class CatalogWindow(QMainWindow):
         self.show_file_ui(False)
         self.update_file_counter()
 
+        # --- Git: init quickly, then pull in background ---
+        try:
+            ensure_git_repo(self.catalog_root, self.settings)
+        except Exception:
+            pass
+
+        def _bg_pull():
+            try:
+                br = (self.settings.get("git_branch") or "main")
+                self.debug(f"Pull: start ({br}) @ {datetime.datetime.now().isoformat(timespec='seconds')}")
+                git_pull(self.catalog_root, br)
+                self.debug("Pull: OK")
+                self._gitbg.ui(lambda: self.push_label.setText("Sync push in: —"))
+            except Exception as ex:
+                self.debug(f"Pull: FAIL → {ex}")
+                self._gitbg.ui(lambda: None)
+
+        self._gitbg.submit(_bg_pull)
+        
     # ---------- Zoom helpers ----------------------------------------------------
     def _mono_font(self, pt: int) -> QFont:
         f = QFont()
@@ -987,9 +1285,22 @@ class CatalogWindow(QMainWindow):
         if dlg.exec_() == QDialog.Accepted:
             self.settings = dlg.result_settings()
             save_settings(self.settings)
+            try:
+                ensure_git_repo(self.catalog_root, self.settings)
+                def _bg_pull():
+                    try:
+                        git_pull(self.catalog_root, (self.settings.get("git_branch") or "main"))
+                        self._gitbg.ui(lambda: self.statusBar().showMessage("Pulled latest from origin", 2500))
+                    except Exception:
+                        self._gitbg.ui(lambda: self.statusBar().showMessage("Pull skipped (no origin/creds).", 4000))
+                self._gitbg.submit(_bg_pull)
+            except Exception:
+                pass
+
             # If a file is open, rebuild schematic subtabs using the new folder
             if self.current_path and self.current_path.is_file():
                 self._rebuild_schematic_tabs_from_scan()
+
 
     # ---------- Schematic (scan folder for PN_*.pdf) ---------------------------
     def _resolve_schematic_root(self, base_dir: Path) -> Path:
@@ -1496,20 +1807,71 @@ class CatalogWindow(QMainWindow):
         self.autosave_label.setText("Autosave in: —" if not self.dirty else f"Autosave in: {self.autosave_remaining_s}s")
 
     def _tick_autosave_countdown(self):
+        """Drive autosave and non-blocking git push countdowns once per second."""
+
+        # ---------- AUTOSAVE ----------
         if not self.current_path and not self.current_folder:
             self.autosave_label.setText("Autosave in: —")
             self.autosave_remaining_s = self.autosave_interval_s
-            return
-        if not self.dirty:
-            self.autosave_label.setText("Autosave in: —")
-            self.autosave_remaining_s = self.autosave_interval_s
-            return
-        if self.autosave_remaining_s <= 0:
-            self.save_from_form(silent=True)
-            self._reset_autosave_countdown()
         else:
-            self.autosave_label.setText(f"Autosave in: {self.autosave_remaining_s}s")
-            self.autosave_remaining_s -= 1
+            if not self.dirty:
+                self.autosave_label.setText("Autosave in: —")
+                self.autosave_remaining_s = self.autosave_interval_s
+            else:
+                if self.autosave_remaining_s <= 0:
+                    self.save_from_form(silent=True)
+                    self._reset_autosave_countdown()
+                else:
+                    self.autosave_label.setText(f"Autosave in: {self.autosave_remaining_s}s")
+                    self.autosave_remaining_s -= 1
+
+        # ---------- ALWAYS run push countdown (do not return early above) ----------
+        if self.git_push_remaining_s is None:
+            self.push_label.setText("Sync push in: —")
+            return
+
+        if self.git_push_remaining_s <= 0:
+            if getattr(self, "_push_inflight", False):
+                # A push is already running; just clear the countdown.
+                self.git_push_remaining_s = None
+                self.push_label.setText("Sync push in: —")
+                return
+
+            def _bg_push():
+                try:
+                    self._push_inflight = True
+                    self._gitbg.ui(lambda: self.push_label.setText("Pushing…"))
+                    branch = (self.settings.get("git_branch") or "main")
+                    self.debug(f"Push: start → origin HEAD:{branch}")
+                    rc, out, err = _git(self.catalog_root, "push", "origin", f"HEAD:{branch}")
+                    if rc == 0:
+                        rc2, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
+                        if rc2 == 0 and sha:
+                            self.debug(f"Push: OK → {sha}")
+                            msg = f"Push OK → origin ({sha})"
+                        else:
+                            self.debug("Push: OK (no sha)")
+                            msg = "Push OK → origin"
+                        self._gitbg.ui(lambda: self.statusBar().showMessage(msg, 3000))
+                    else:
+                        self.debug(f"Push: FAIL → {err or out or 'unknown'}")
+                        self._gitbg.ui(lambda: self.statusBar().showMessage(
+                            f"Push failed: {err or out or 'unknown error'}", 6000))
+                except Exception as ex:
+                    self.debug(f"Push: EXC → {ex}")
+                    self._gitbg.ui(lambda: self.statusBar().showMessage("Push failed (exception).", 5000))
+                finally:
+                    self._push_inflight = False
+                    self._gitbg.ui(lambda: self.push_label.setText("Sync push in: —"))
+
+            # schedule background push and clear countdown
+            self._gitbg.submit(_bg_push)
+            self.git_push_remaining_s = None
+            return
+
+        # countdown still running
+        self.push_label.setText(f"Sync push in: {self.git_push_remaining_s}s")
+        self.git_push_remaining_s -= 1
 
     # ---------- File counter helpers -------------------------------------------
     def _count_md_recursive(self, folder: Path) -> int:
@@ -1996,24 +2358,44 @@ class CatalogWindow(QMainWindow):
 
     # ---------- Save ------------------------------------------------------------
     def save_from_form(self, silent: bool = False):
-        # Save file
+        """Save current file or folder metadata, commit the change, and schedule a background push."""
+        # ---- Save Markdown file ----
+        self.debug(f"Save: start → file={self.current_path} folder={self.current_folder}")
         if self.current_path and self.current_path.is_file() and self.current_path.suffix.lower() == ".md":
-            # If Review tab active/dirty, save raw text
+            # Raw (Review tab) save
             if self.review_dirty or self._strip_dot(self.tabs.tabText(self.tabs.currentIndex())) == "Review":
                 raw = self.review_edit.toPlainText()
                 try:
                     self.current_path.write_text(raw, encoding="utf-8")
                 except Exception as e:
-                    self.error("Error", f"Failed to save file:\n{e}"); return
+                    self.error("Error", f"Failed to save file:\n{e}")
+                    return
                 if not silent:
                     self.load_file(self.current_path)
                 self.review_dirty = False
                 self._clear_dirty()
                 self._reset_autosave_countdown()
                 self._update_stats_on_save(self.current_path, raw)
+
+                # Commit and schedule push
+                try:
+                    highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
+                    msg = f"REV {highest}"
+                    self.debug(f"Commit: REV {highest}")
+                    if git_commit_all(self.catalog_root, msg):
+                        rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
+                        if rc_sha == 0 and sha:
+                            self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
+                            self.debug("Commit: OK")
+                        self._schedule_git_push()
+                    else:
+                        self.statusBar().showMessage("No changes to commit.", 2000)
+                        self.debug("Commit: no changes")
+                except Exception:
+                    pass
                 return
 
-            # Structured save
+            # Structured save (form→markdown)
             fields = {k: w.text().strip() for k, w in self.field_widgets.items()}
 
             rev_rows = []
@@ -2045,7 +2427,8 @@ class CatalogWindow(QMainWindow):
             try:
                 self.current_path.write_text(text, encoding="utf-8")
             except Exception as e:
-                self.error("Error", f"Failed to save file:\n{e}"); return
+                self.error("Error", f"Failed to save file:\n{e}")
+                return
 
             self.review_edit.blockSignals(True)
             self.review_edit.setPlainText(text)
@@ -2055,9 +2438,24 @@ class CatalogWindow(QMainWindow):
             self._reset_autosave_countdown()
             self.proxy.refresh_desc(self.current_path)
             self._update_stats_on_save(self.current_path, text)
+
+            # Commit and schedule push
+            try:
+                highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
+                msg = f"REV {highest}"
+                self.debug(f"Commit: REV {highest}")
+                if git_commit_all(self.catalog_root, msg):
+                    rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
+                    if rc_sha == 0 and sha:
+                        self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
+                    self._schedule_git_push()
+                else:
+                    self.statusBar().showMessage("No changes to commit.", 2000)
+            except Exception:
+                pass
             return
 
-        # Save folder metadata
+        # ---- Save folder metadata ----
         if self.current_folder and self.current_folder.exists() and self.current_folder.is_dir():
             meta_p = folder_meta_path(self.current_folder)
             created = today_iso()
@@ -2071,7 +2469,7 @@ class CatalogWindow(QMainWindow):
             raw_tags = (self.folder_tags.text() or "").strip()
             tags_list = [t.strip() for t in raw_tags.split(",") if t.strip()]
 
-            meta = ({
+            meta = {
                 "TITLE": (self.folder_title.text() or "").upper(),
                 "DESCRIPTION": (self.folder_desc.text() or "").upper(),
                 "Summary": self.folder_summary.toPlainText().strip(),
@@ -2079,11 +2477,27 @@ class CatalogWindow(QMainWindow):
                 "Tags": tags_list,
                 "Created": created,
                 "Last Updated": today_iso(),
-            })
+            }
             try:
                 meta_p.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             except Exception as e:
-                self.error("Error", f"Failed to save folder metadata:\n{e}"); return
+                self.error("Error", f"Failed to save folder metadata:\n{e}")
+                return
+
+            # Commit and schedule push (folder-level change)
+            try:
+                highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
+                msg = f"REV {highest}"
+                self.debug(f"Commit: REV {highest}")
+                if git_commit_all(self.catalog_root, msg):
+                    rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
+                    if rc_sha == 0 and sha:
+                        self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
+                    self._schedule_git_push()
+                else:
+                    self.statusBar().showMessage("No changes to commit.", 2000)
+            except Exception:
+                pass
 
             self.proxy.refresh_desc(self.current_folder)
             self.folder_created.setText(meta["Created"])
@@ -2094,37 +2508,9 @@ class CatalogWindow(QMainWindow):
                 self.info("Saved", "Folder metadata saved.")
             return
 
+        # ---- Nothing selected to save ----
         if not silent:
             self.info("Save", "Select a folder or a Markdown file to save.")
-
-    # ---------- Folder metadata / archive / file ops ---------------------------
-    def read_folder_meta(self, folder: Path) -> dict:
-        meta_p = folder_meta_path(folder)
-        if not meta_p.exists():
-            meta = {
-                "TITLE": "", "DESCRIPTION": "", "Summary": "", "Owner": "",
-                "Tags": [], "Created": today_iso(), "Last Updated": today_iso(),
-            }
-            try: meta_p.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            except Exception: pass
-            return meta
-        try:
-            meta = json.loads(meta_p.read_text(encoding="utf-8"))
-            meta.setdefault("TITLE", meta.get("title", "").upper() if meta.get("title") else meta.get("TITLE",""))
-            meta.setdefault("DESCRIPTION", meta.get("description", "").upper() if meta.get("description") else meta.get("DESCRIPTION",""))
-            meta.setdefault("Summary", meta.get("Summary", ""))
-            meta.setdefault("Owner", meta.get("Owner", ""))
-            if "Tags" in meta and isinstance(meta["Tags"], str):
-                meta["Tags"] = [t.strip() for t in meta["Tags"].split(",") if t.strip()]
-            meta.setdefault("Tags", meta.get("Tags", []))
-            meta.setdefault("Created", meta.get("Created", today_iso()))
-            meta.setdefault("Last Updated", meta.get("Last Updated", today_iso()))
-            return meta
-        except Exception:
-            return {
-                "TITLE": "", "DESCRIPTION": "", "Summary": "", "Owner": "",
-                "Tags": [], "Created": today_iso(), "Last Updated": today_iso(),
-            }
 
     def archive_script_folder(self):
         try:
@@ -2339,6 +2725,12 @@ class CatalogWindow(QMainWindow):
 
         self.update_file_counter()
 
+    def debug(self, msg: str):
+        try:
+            self._logger.log(msg)
+        except Exception:
+            pass
+
     def delete_item(self):
         path = self.selected_path()
         if not path: return
@@ -2355,6 +2747,18 @@ class CatalogWindow(QMainWindow):
         if self.current_folder and self.current_folder == path:
             self.current_folder = None; self.path_label.setText("")
         self.update_file_counter()
+
+    def _schedule_git_push(self):
+        self.debug(f"Push: scheduled in {self.git_push_remaining_s}s")
+        self.git_push_delay_s = int(self.settings.get("auto_push_delay_seconds", 60))
+        self.git_push_remaining_s = max(1, self.git_push_delay_s)
+        self.push_label.setText(f"Sync push in: {self.git_push_remaining_s}s")
+
+    def _note(self, msg: str, ms: int = 4000):
+        try:
+            self.statusBar().showMessage(msg, ms)
+        except Exception:
+            pass
 
 # ---------- Boot ---------------------------------------------------------------
 def ensure_catalog_root(start_dir: Path | None = None) -> Path:
