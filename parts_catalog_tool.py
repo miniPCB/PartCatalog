@@ -1,9 +1,33 @@
 #!/usr/bin/env python3
 """
-Parts Catalog Tool — PyQt5 (Dark-only, Focused Editor v13)
+Parts Catalog Tool — PyQt5 (Dark-only, Focused Editor v15)
 
 Revision History (Code)
 -----------------------
+- 2025-10-03 — Git pre-save pull, Git enable/disable, and debug console tweaks
+  Author: Nolan Manteufel
+  Description of Change:
+    - Git safety before save:
+      • Added _safe_pull_before_save(): fetches and pulls (rebase + autostash) before writing/committing.
+      • On conflict, rebase aborts gracefully; file is still saved locally; commit/push are skipped with a clear status message.
+    - Git scheduling unchanged (push happens ~60s after a successful commit), but now:
+      • Respect “git_enabled” setting everywhere; when disabled, no pulls/commits/pushes are attempted.
+      • “Sync push in: —” remains static while Git is disabled.
+    - Settings & Tools:
+      • Added “Enable Git (pull/commit/push)” checkbox (backed by settings["git_enabled"], default True).
+      • No other UI layout changes.
+    - Autosave/push loop:
+      • _tick_autosave_countdown() updated to read git_enabled: when False, the push countdown is idle and the label stays “—”.
+    - Save pipeline:
+      • save_from_form() calls _safe_pull_before_save() before commit; skips commit/push on pull failure/conflict.
+    - Debug console:
+      • Removed the far-right toolbar buttons (Copy, Copy All, Save Log, Clear). 
+      • Kept the right-click context menu actions exactly as they are.
+    - Folder/File panel toggle:
+      • Ensured the correct visibility logic via _toggle_panels() (folder panel only in folder mode; tabs only in file mode).
+    - Repository stats (lines_total):
+      • Guarded the line counter to avoid counting binary files and .git internals; heavy work is batched to avoid UI stalls.
+
 - 2025-10-01 — Schematic PDFs, Viewer Fit, and PDF UX Hardening
   Author: Nolan Manteufel
   Description of Change:
