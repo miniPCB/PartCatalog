@@ -1071,13 +1071,12 @@ class CatalogWindow(QMainWindow):
             menu.exec_(self.debug_console.mapToGlobal(pos))
         self.debug_console.customContextMenuRequested.connect(_dbg_menu)
 
-        # Optional toolbar buttons
-        act_dbg_copy = QtAction("Copy", self); act_dbg_copy.setShortcut(QKeySequence.Copy); act_dbg_copy.triggered.connect(self.debug_console.copy)
-        act_dbg_copy_all = QtAction("Copy All", self); act_dbg_copy_all.setShortcut(QKeySequence("Ctrl+Shift+C")); act_dbg_copy_all.triggered.connect(_dbg_copy_all)
-        act_dbg_save = QtAction("Save Log…", self); act_dbg_save.setShortcut(QKeySequence("Ctrl+Shift+S")); act_dbg_save.triggered.connect(_dbg_save)
-        act_dbg_clear = QtAction("Clear Log", self); act_dbg_clear.setShortcut(QKeySequence("Ctrl+Shift+L")); act_dbg_clear.triggered.connect(self.debug_console.clear)
-        tb.addSeparator(); tb.addAction(act_dbg_copy); tb.addAction(act_dbg_copy_all); tb.addAction(act_dbg_save); tb.addAction(act_dbg_clear)
-
+        # # Optional toolbar buttons
+        # act_dbg_copy = QtAction("Copy", self); act_dbg_copy.setShortcut(QKeySequence.Copy); act_dbg_copy.triggered.connect(self.debug_console.copy)
+        # act_dbg_copy_all = QtAction("Copy All", self); act_dbg_copy_all.setShortcut(QKeySequence("Ctrl+Shift+C")); act_dbg_copy_all.triggered.connect(_dbg_copy_all)
+        # act_dbg_save = QtAction("Save Log…", self); act_dbg_save.setShortcut(QKeySequence("Ctrl+Shift+S")); act_dbg_save.triggered.connect(_dbg_save)
+        # act_dbg_clear = QtAction("Clear Log", self); act_dbg_clear.setShortcut(QKeySequence("Ctrl+Shift+L")); act_dbg_clear.triggered.connect(self.debug_console.clear)
+        # tb.addSeparator(); tb.addAction(act_dbg_copy); tb.addAction(act_dbg_copy_all); tb.addAction(act_dbg_save); tb.addAction(act_dbg_clear)
 
         # --- Footer (file counters) ---
         footer = QWidget(self)
