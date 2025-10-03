@@ -2374,33 +2374,23 @@ class CatalogWindow(QMainWindow):
 
     # ---------- Save ------------------------------------------------------------
     def save_from_form(self, silent: bool = False):
-        """Save current file or folder metadata, optionally commit, and (when enabled) schedule a background push."""
+        """Save current file or folder metadata, commit the change, and schedule a background push."""
         self.debug(f"Save: start → file={self.current_path} folder={self.current_folder}")
 
-        def _maybe_commit_and_schedule_push():
-            """Commit all changes and start a push countdown if git is enabled."""
-            if not self.settings.get("git_enabled", True):
-                # Git disabled → do nothing Git-related; keep push label static.
-                self.debug("Git disabled: skipping commit/push.")
-                return
+        # Decide if we should try to commit/push after saving (default yes).
+        # We’ll flip this to False if the pre-save pull indicates conflicts/failure.
+        allow_commit_push = True
 
-            try:
-                highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
-                msg = f"REV {highest}"
-                self.debug(f"Commit: {msg}")
-                if git_commit_all(self.catalog_root, msg):
-                    rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
-                    if rc_sha == 0 and sha:
-                        self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
-                    self._schedule_git_push()
-                else:
-                    self.statusBar().showMessage("No changes to commit.", 2000)
-            except Exception as ex:
-                self.debug(f"Commit exception: {ex!r}")
+        # Only attempt a pre-save pull when we’re saving something real (file or folder)
+        something_selected = (self.current_path and self.current_path.is_file()) or (self.current_folder and self.current_folder.is_dir())
+        if something_selected:
+            ok_to_commit = self._safe_pull_before_save()
+            if not ok_to_commit:
+                allow_commit_push = False
 
         # ---- Save Markdown file ----
         if self.current_path and self.current_path.is_file() and self.current_path.suffix.lower() == ".md":
-            # If Review tab was edited (raw save)
+            # If the Review tab was edited or Review is active, save raw text verbatim
             if self.review_dirty or self._strip_dot(self.tabs.tabText(self.tabs.currentIndex())) == "Review":
                 raw = self.review_edit.toPlainText()
                 try:
@@ -2408,13 +2398,35 @@ class CatalogWindow(QMainWindow):
                 except Exception as e:
                     self.error("Error", f"Failed to save file:\n{e}")
                     return
+
                 if not silent:
                     self.load_file(self.current_path)
+
                 self.review_dirty = False
                 self._clear_dirty()
                 self._reset_autosave_countdown()
                 self._update_stats_on_save(self.current_path, raw)
-                _maybe_commit_and_schedule_push()
+
+                # Commit and schedule push (if allowed)
+                if allow_commit_push and bool(self.settings.get("git_enabled", True)):
+                    try:
+                        highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
+                        msg = f"REV {highest}"
+                        self.debug(f"Commit: {msg}")
+                        if git_commit_all(self.catalog_root, msg):
+                            rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
+                            if rc_sha == 0 and sha:
+                                self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
+                            self._schedule_git_push()
+                        else:
+                            self.statusBar().showMessage("No changes to commit.", 2000)
+                    except Exception:
+                        pass
+                else:
+                    # Either git disabled or pull failed → skip commit/push
+                    if bool(self.settings.get("git_enabled", True)) and not allow_commit_push:
+                        self.debug("Commit: skipped due to pre-save pull failure/conflict")
+
                 return
 
             # Structured save (form → markdown)
@@ -2426,7 +2438,7 @@ class CatalogWindow(QMainWindow):
                 for c in range(len(REV_HEADERS)):
                     it = self.rev_table.item(r, c)
                     row.append(it.text().strip() if it else "")
-                # Backfill empty “By” with default owner
+                # Backfill empty “By” with default owner if blank
                 if len(row) >= 4 and not row[3].strip():
                     row[3] = self._default_owner_for_context()
                 rev_rows.append(row)
@@ -2452,18 +2464,34 @@ class CatalogWindow(QMainWindow):
                 self.error("Error", f"Failed to save file:\n{e}")
                 return
 
-            # Sync Review tab without triggering textChanged
             self.review_edit.blockSignals(True)
             self.review_edit.setPlainText(text)
             self.review_edit.blockSignals(False)
             self.review_dirty = False
-
             self._clear_dirty()
             self._reset_autosave_countdown()
             self.proxy.refresh_desc(self.current_path)
             self._update_stats_on_save(self.current_path, text)
 
-            _maybe_commit_and_schedule_push()
+            # Commit and schedule push (if allowed)
+            if allow_commit_push and bool(self.settings.get("git_enabled", True)):
+                try:
+                    highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
+                    msg = f"REV {highest}"
+                    self.debug(f"Commit: {msg}")
+                    if git_commit_all(self.catalog_root, msg):
+                        rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
+                        if rc_sha == 0 and sha:
+                            self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
+                        self._schedule_git_push()
+                    else:
+                        self.statusBar().showMessage("No changes to commit.", 2000)
+                except Exception:
+                    pass
+            else:
+                if bool(self.settings.get("git_enabled", True)) and not allow_commit_push:
+                    self.debug("Commit: skipped due to pre-save pull failure/conflict")
+
             return
 
         # ---- Save folder metadata ----
@@ -2495,7 +2523,24 @@ class CatalogWindow(QMainWindow):
                 self.error("Error", f"Failed to save folder metadata:\n{e}")
                 return
 
-            _maybe_commit_and_schedule_push()
+            # Commit and schedule push (if allowed)
+            if allow_commit_push and bool(self.settings.get("git_enabled", True)):
+                try:
+                    highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
+                    msg = f"REV {highest}"
+                    self.debug(f"Commit: {msg}")
+                    if git_commit_all(self.catalog_root, msg):
+                        rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
+                        if rc_sha == 0 and sha:
+                            self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
+                        self._schedule_git_push()
+                    else:
+                        self.statusBar().showMessage("No changes to commit.", 2000)
+                except Exception:
+                    pass
+            else:
+                if bool(self.settings.get("git_enabled", True)) and not allow_commit_push:
+                    self.debug("Commit: skipped due to pre-save pull failure/conflict")
 
             self.proxy.refresh_desc(self.current_folder)
             self.folder_created.setText(meta["Created"])
@@ -2509,33 +2554,6 @@ class CatalogWindow(QMainWindow):
         # ---- Nothing selected to save ----
         if not silent:
             self.info("Save", "Select a folder or a Markdown file to save.")
-
-    def archive_script_folder(self):
-        try:
-            script_dir = _script_dir()
-        except Exception:
-            self.error("Archive", "Could not determine script directory."); return
-
-        ts = now_stamp()
-        temp_base = Path(tempfile.gettempdir()) / ts
-        try:
-            shutil.make_archive(str(temp_base), 'zip', root_dir=str(script_dir.parent), base_dir=script_dir.name)
-        except Exception as e:
-            self.error("Archive", f"Failed to create archive:\n{e}"); return
-
-        temp_zip = Path(str(temp_base) + ".zip")
-        if not temp_zip.exists():
-            self.error("Archive", "Archive creation failed (file missing)."); return
-
-        dest_zip = script_dir / f"{ts}.zip"
-        try:
-            if dest_zip.exists():
-                dest_zip = script_dir / f"{ts}_1.zip"
-            shutil.move(str(temp_zip), str(dest_zip))
-        except Exception as e:
-            self.error("Archive", f"Failed to move archive into folder:\n{e}"); return
-
-        self.info("Archive", f"Created: {dest_zip}")
 
     def open_file_location(self):
         path = self.selected_path()
@@ -2769,6 +2787,55 @@ class CatalogWindow(QMainWindow):
             self.statusBar().showMessage(msg, ms)
         except Exception:
             pass
+    
+    def _safe_pull_before_save(self) -> bool:
+        """
+        Try to pull latest changes before we write/commit.
+        Returns True if it's safe to proceed with commit/push, False if we should skip commit.
+        Never raises; logs to the debug console and status bar instead.
+        """
+        # Respect the setting (default True if not present)
+        if not bool(self.settings.get("git_enabled", True)):
+            self.debug("Pull: skipped (git disabled)")
+            return True
+
+        # Require an 'origin' remote; if not present, just proceed locally
+        rc, remotes, _ = _git(self.catalog_root, "remote")
+        if rc != 0 or "origin" not in (remotes or "").splitlines():
+            self.debug("Pull: skipped (no origin)")
+            return True
+
+        branch = (self.settings.get("git_branch") or "main").strip() or "main"
+
+        try:
+            # Fetch first for clarity
+            self.debug(f"Pull: pre-save fetch origin/{branch}")
+            _git(self.catalog_root, "fetch", "origin", branch)
+
+            # Pull with rebase; autostash helps when there are local changes
+            self.debug(f"Pull: pre-save pull --rebase --autostash from origin/{branch}")
+            rc, out, err = _git(self.catalog_root, "pull", "--rebase", "--autostash", "origin", branch)
+            if rc == 0:
+                self.debug("Pull: pre-save OK")
+                return True
+
+            # If rebase conflicts, try to abort cleanly and skip commit/push
+            self.debug(f"Pull: pre-save failed; attempting rebase --abort → {err or out}")
+            _git(self.catalog_root, "rebase", "--abort")
+            self._gitbg.ui(lambda: self.statusBar().showMessage(
+                "Remote changes conflict with your local edits. Saved locally; commit/push skipped. Resolve and save again.",
+                6000
+            ))
+            return False
+
+        except Exception as ex:
+            self.debug(f"Pull: pre-save exception → {ex!r}")
+            # Conservative: allow save, but skip commit/push
+            self._gitbg.ui(lambda: self.statusBar().showMessage(
+                "Pre-save pull failed. Saved locally; commit/push skipped.", 6000
+            ))
+            return False
+
 
 # ---------- Boot ---------------------------------------------------------------
 def ensure_catalog_root(start_dir: Path | None = None) -> Path:
