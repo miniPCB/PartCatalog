@@ -1841,29 +1841,26 @@ class CatalogWindow(QMainWindow):
                     self._push_inflight = True
                     self._gitbg.ui(lambda: self.push_label.setText("Pushing…"))
                     branch = (self.settings.get("git_branch") or "main")
-                    self.debug(f"Push: start → origin HEAD:{branch}")
+                    self.debug(f"Push: start → branch={branch}")
                     rc, out, err = _git(self.catalog_root, "push", "origin", f"HEAD:{branch}")
                     if rc == 0:
                         rc2, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
-                        if rc2 == 0 and sha:
-                            self.debug(f"Push: OK → {sha}")
-                            msg = f"Push OK → origin ({sha})"
-                        else:
-                            self.debug("Push: OK (no sha)")
-                            msg = "Push OK → origin"
-                        self._gitbg.ui(lambda: self.statusBar().showMessage(msg, 3000))
+                        sha_msg = f" ({sha})" if (rc2 == 0 and sha) else ""
+                        self.debug(f"Push: ok{sha_msg}")
+                        self._gitbg.ui(lambda: self.statusBar().showMessage(f"Push OK → origin{sha_msg}", 3000))
                     else:
-                        self.debug(f"Push: FAIL → {err or out or 'unknown'}")
-                        self._gitbg.ui(lambda: self.statusBar().showMessage(
-                            f"Push failed: {err or out or 'unknown error'}", 6000))
+                        msg = (err or out or "unknown error")
+                        self.debug(f"Push: fail → {msg}")
+                        self._gitbg.ui(lambda: self.statusBar().showMessage(f"Push failed: {msg}", 6000))
                 except Exception as ex:
-                    self.debug(f"Push: EXC → {ex}")
+                    self.debug(f"Push: exception → {ex!r}")
                     self._gitbg.ui(lambda: self.statusBar().showMessage("Push failed (exception).", 5000))
                 finally:
                     self._push_inflight = False
                     self._gitbg.ui(lambda: self.push_label.setText("Sync push in: —"))
 
             # schedule background push and clear countdown
+            self.debug("Push: countdown reached 0 → dispatching")
             self._gitbg.submit(_bg_push)
             self.git_push_remaining_s = None
             return
@@ -2748,10 +2745,17 @@ class CatalogWindow(QMainWindow):
         self.update_file_counter()
 
     def _schedule_git_push(self):
-        self.debug(f"Push: scheduled in {self.git_push_remaining_s}s")
-        self.git_push_delay_s = int(self.settings.get("auto_push_delay_seconds", 60))
-        self.git_push_remaining_s = max(1, self.git_push_delay_s)
+        # Use settings delay; default to 60 if unset/invalid
+        try:
+            delay = int(self.settings.get("auto_push_delay_seconds", 60))
+        except Exception:
+            delay = 60
+        delay = max(1, delay)
+
+        self.git_push_delay_s = delay
+        self.git_push_remaining_s = delay  # <-- never None here
         self.push_label.setText(f"Sync push in: {self.git_push_remaining_s}s")
+        self.debug(f"Push: scheduled in {self.git_push_remaining_s}s")
 
     def _note(self, msg: str, ms: int = 4000):
         try:
