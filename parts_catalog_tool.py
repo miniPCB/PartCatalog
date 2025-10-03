@@ -2860,6 +2860,42 @@ class CatalogWindow(QMainWindow):
             ))
             return False
 
+    def archive_script_folder(self):
+        """Zip the folder containing this script and drop the archive inside it."""
+        try:
+            script_dir = _script_dir()
+        except Exception:
+            self.error("Archive", "Could not determine script directory.")
+            return
+
+        ts = now_stamp()
+        temp_base = Path(tempfile.gettempdir()) / ts
+
+        try:
+            # Create zip of the script folder (parent=root_dir, base_dir=folder name)
+            shutil.make_archive(str(temp_base), 'zip',
+                                root_dir=str(script_dir.parent),
+                                base_dir=script_dir.name)
+        except Exception as e:
+            self.error("Archive", f"Failed to create archive:\n{e}")
+            return
+
+        temp_zip = Path(str(temp_base) + ".zip")
+        if not temp_zip.exists():
+            self.error("Archive", "Archive creation failed (file missing).")
+            return
+
+        dest_zip = script_dir / f"{ts}.zip"
+        try:
+            if dest_zip.exists():
+                # Avoid overwrite if same-second archive already exists
+                dest_zip = script_dir / f"{ts}_1.zip"
+            shutil.move(str(temp_zip), str(dest_zip))
+        except Exception as e:
+            self.error("Archive", f"Failed to move archive into folder:\n{e}")
+            return
+
+        self.info("Archive", f"Created: {dest_zip}")
 
 # ---------- Boot ---------------------------------------------------------------
 def ensure_catalog_root(start_dir: Path | None = None) -> Path:
