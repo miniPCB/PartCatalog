@@ -98,7 +98,7 @@ from PyQt5.QtWidgets import (
     QLineEdit, QHeaderView, QPushButton, QSpacerItem, QSizePolicy,
     QGroupBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QStyleFactory, QStyledItemDelegate, QFormLayout, QPlainTextEdit,
-    QDialog, QDialogButtonBox, QSpinBox
+    QDialog, QDialogButtonBox, QSpinBox, QCheckBox
 )
 from PyQt5.QtWidgets import QAction as QtAction
 
@@ -131,7 +131,8 @@ DEFAULT_SETTINGS = {
     "git_remote_url": "",              # e.g., "git@github.com:org/repo.git" (SSH recommended)
     "git_branch": "main",              # default branch to pull/push
     "auto_push_delay_seconds": 60,     # countdown refreshed after each save
-    "show_debug_console": True         
+    "show_debug_console": True,
+    "git_enabled": True         
 }
 
 def load_settings() -> dict:
@@ -708,6 +709,10 @@ class SettingsToolsDialog(QDialog):
         sf.addRow("Git Remote (origin):", self.git_remote)
         sf.addRow("Git Branch:", self.git_branch)
         sf.addRow("Push Delay (sec):", self.push_delay)
+        # Enable/disable Git entirely
+        self.git_enabled_cb = QCheckBox("Enable Git (pull / commit / push)", self)
+        self.git_enabled_cb.setChecked(bool(self.settings.get("git_enabled", True)))
+        sf.addRow(self.git_enabled_cb)
 
         sf.addRow("Default Owner Name:", self.owner_default)
         sf.addRow("New File Prefix:", self.prefix)
@@ -775,6 +780,7 @@ class SettingsToolsDialog(QDialog):
         out["file_name_prefix"] = self.prefix.text().strip()
         out["number_width"] = int(self.width.value())
         out["schematic_folder"] = self.schematic_folder_edit.text().strip()
+        out["git_enabled"] = bool(self.git_enabled_cb.isChecked())
         return out
 
 # ---------- Background Git queue (non-blocking) -------------------------------
@@ -1201,23 +1207,28 @@ class CatalogWindow(QMainWindow):
         self.update_file_counter()
 
         # --- Git: init quickly, then pull in background ---
-        try:
-            ensure_git_repo(self.catalog_root, self.settings)
-        except Exception:
-            pass
-
-        def _bg_pull():
+        if self.settings.get("git_enabled", True):
             try:
-                br = (self.settings.get("git_branch") or "main")
-                self.debug(f"Pull: start ({br}) @ {datetime.datetime.now().isoformat(timespec='seconds')}")
-                git_pull(self.catalog_root, br)
-                self.debug("Pull: OK")
-                self._gitbg.ui(lambda: self.push_label.setText("Sync push in: —"))
-            except Exception as ex:
-                self.debug(f"Pull: FAIL → {ex}")
-                self._gitbg.ui(lambda: None)
+                ensure_git_repo(self.catalog_root, self.settings)
+            except Exception:
+                pass
 
-        self._gitbg.submit(_bg_pull)
+            def _bg_pull():
+                try:
+                    br = (self.settings.get("git_branch") or "main")
+                    self.debug(f"Pull: start ({br}) @ {datetime.datetime.now().isoformat(timespec='seconds')}")
+                    git_pull(self.catalog_root, br)
+                    self.debug("Pull: OK")
+                    self._gitbg.ui(lambda: self.push_label.setText("Sync push in: —"))
+                except Exception as ex:
+                    self.debug(f"Pull: FAIL → {ex}")
+                    self._gitbg.ui(lambda: None)
+
+            self._gitbg.submit(_bg_pull)
+        else:
+            self.debug("Git: disabled")
+            self.push_label.setText("Sync push in: —")
+            self.git_push_remaining_s = None
         
     # ---------- Zoom helpers ----------------------------------------------------
     def _mono_font(self, pt: int) -> QFont:
@@ -1256,17 +1267,22 @@ class CatalogWindow(QMainWindow):
         if dlg.exec_() == QDialog.Accepted:
             self.settings = dlg.result_settings()
             save_settings(self.settings)
-            try:
-                ensure_git_repo(self.catalog_root, self.settings)
-                def _bg_pull():
-                    try:
-                        git_pull(self.catalog_root, (self.settings.get("git_branch") or "main"))
-                        self._gitbg.ui(lambda: self.statusBar().showMessage("Pulled latest from origin", 2500))
-                    except Exception:
-                        self._gitbg.ui(lambda: self.statusBar().showMessage("Pull skipped (no origin/creds).", 4000))
-                self._gitbg.submit(_bg_pull)
-            except Exception:
-                pass
+            if self.settings.get("git_enabled", True):
+                try:
+                    ensure_git_repo(self.catalog_root, self.settings)
+                    def _bg_pull():
+                        try:
+                            git_pull(self.catalog_root, (self.settings.get("git_branch") or "main"))
+                            self._gitbg.ui(lambda: self.statusBar().showMessage("Pulled latest from origin", 2500))
+                        except Exception:
+                            self._gitbg.ui(lambda: self.statusBar().showMessage("Pull skipped (no origin/creds).", 4000))
+                    self._gitbg.submit(_bg_pull)
+                except Exception:
+                    pass
+            else:
+                # Turn off any pending push countdown and keep label static
+                self.git_push_remaining_s = None
+                self.push_label.setText("Sync push in: —")
 
             # If a file is open, rebuild schematic subtabs using the new folder
             if self.current_path and self.current_path.is_file():
@@ -1778,7 +1794,7 @@ class CatalogWindow(QMainWindow):
         self.autosave_label.setText("Autosave in: —" if not self.dirty else f"Autosave in: {self.autosave_remaining_s}s")
 
     def _tick_autosave_countdown(self):
-        """Drive autosave and non-blocking git push countdowns once per second."""
+        """Drive autosave and (when enabled) non-blocking git push countdown once per second."""
 
         # ---------- AUTOSAVE ----------
         if not self.current_path and not self.current_folder:
@@ -1796,11 +1812,19 @@ class CatalogWindow(QMainWindow):
                     self.autosave_label.setText(f"Autosave in: {self.autosave_remaining_s}s")
                     self.autosave_remaining_s -= 1
 
-        # ---------- ALWAYS run push countdown (do not return early above) ----------
+        # ---------- GIT PUSH COUNTDOWN ----------
+        # If Git is disabled, keep the label static and skip all countdown/push logic.
+        if not self.settings.get("git_enabled", True):
+            self.push_label.setText("Sync push in: —")
+            self.git_push_remaining_s = None
+            return
+
+        # If no countdown is active, keep the label static.
         if self.git_push_remaining_s is None:
             self.push_label.setText("Sync push in: —")
             return
 
+        # Countdown reached zero → attempt push (unless one is already running).
         if self.git_push_remaining_s <= 0:
             if getattr(self, "_push_inflight", False):
                 # A push is already running; just clear the countdown.
@@ -1831,13 +1855,13 @@ class CatalogWindow(QMainWindow):
                     self._push_inflight = False
                     self._gitbg.ui(lambda: self.push_label.setText("Sync push in: —"))
 
-            # schedule background push and clear countdown
+            # Schedule background push and clear countdown.
             self.debug("Push: countdown reached 0 → dispatching")
             self._gitbg.submit(_bg_push)
             self.git_push_remaining_s = None
             return
 
-        # countdown still running
+        # Countdown still running
         self.push_label.setText(f"Sync push in: {self.git_push_remaining_s}s")
         self.git_push_remaining_s -= 1
 
@@ -2326,11 +2350,33 @@ class CatalogWindow(QMainWindow):
 
     # ---------- Save ------------------------------------------------------------
     def save_from_form(self, silent: bool = False):
-        """Save current file or folder metadata, commit the change, and schedule a background push."""
-        # ---- Save Markdown file ----
+        """Save current file or folder metadata, optionally commit, and (when enabled) schedule a background push."""
         self.debug(f"Save: start → file={self.current_path} folder={self.current_folder}")
+
+        def _maybe_commit_and_schedule_push():
+            """Commit all changes and start a push countdown if git is enabled."""
+            if not self.settings.get("git_enabled", True):
+                # Git disabled → do nothing Git-related; keep push label static.
+                self.debug("Git disabled: skipping commit/push.")
+                return
+
+            try:
+                highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
+                msg = f"REV {highest}"
+                self.debug(f"Commit: {msg}")
+                if git_commit_all(self.catalog_root, msg):
+                    rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
+                    if rc_sha == 0 and sha:
+                        self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
+                    self._schedule_git_push()
+                else:
+                    self.statusBar().showMessage("No changes to commit.", 2000)
+            except Exception as ex:
+                self.debug(f"Commit exception: {ex!r}")
+
+        # ---- Save Markdown file ----
         if self.current_path and self.current_path.is_file() and self.current_path.suffix.lower() == ".md":
-            # Raw (Review tab) save
+            # If Review tab was edited (raw save)
             if self.review_dirty or self._strip_dot(self.tabs.tabText(self.tabs.currentIndex())) == "Review":
                 raw = self.review_edit.toPlainText()
                 try:
@@ -2344,26 +2390,10 @@ class CatalogWindow(QMainWindow):
                 self._clear_dirty()
                 self._reset_autosave_countdown()
                 self._update_stats_on_save(self.current_path, raw)
-
-                # Commit and schedule push
-                try:
-                    highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
-                    msg = f"REV {highest}"
-                    self.debug(f"Commit: REV {highest}")
-                    if git_commit_all(self.catalog_root, msg):
-                        rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
-                        if rc_sha == 0 and sha:
-                            self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
-                            self.debug("Commit: OK")
-                        self._schedule_git_push()
-                    else:
-                        self.statusBar().showMessage("No changes to commit.", 2000)
-                        self.debug("Commit: no changes")
-                except Exception:
-                    pass
+                _maybe_commit_and_schedule_push()
                 return
 
-            # Structured save (form→markdown)
+            # Structured save (form → markdown)
             fields = {k: w.text().strip() for k, w in self.field_widgets.items()}
 
             rev_rows = []
@@ -2372,7 +2402,7 @@ class CatalogWindow(QMainWindow):
                 for c in range(len(REV_HEADERS)):
                     it = self.rev_table.item(r, c)
                     row.append(it.text().strip() if it else "")
-                # Backfill empty “By” with default owner if blank
+                # Backfill empty “By” with default owner
                 if len(row) >= 4 and not row[3].strip():
                     row[3] = self._default_owner_for_context()
                 rev_rows.append(row)
@@ -2398,29 +2428,18 @@ class CatalogWindow(QMainWindow):
                 self.error("Error", f"Failed to save file:\n{e}")
                 return
 
+            # Sync Review tab without triggering textChanged
             self.review_edit.blockSignals(True)
             self.review_edit.setPlainText(text)
             self.review_edit.blockSignals(False)
             self.review_dirty = False
+
             self._clear_dirty()
             self._reset_autosave_countdown()
             self.proxy.refresh_desc(self.current_path)
             self._update_stats_on_save(self.current_path, text)
 
-            # Commit and schedule push
-            try:
-                highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
-                msg = f"REV {highest}"
-                self.debug(f"Commit: REV {highest}")
-                if git_commit_all(self.catalog_root, msg):
-                    rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
-                    if rc_sha == 0 and sha:
-                        self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
-                    self._schedule_git_push()
-                else:
-                    self.statusBar().showMessage("No changes to commit.", 2000)
-            except Exception:
-                pass
+            _maybe_commit_and_schedule_push()
             return
 
         # ---- Save folder metadata ----
@@ -2452,20 +2471,7 @@ class CatalogWindow(QMainWindow):
                 self.error("Error", f"Failed to save folder metadata:\n{e}")
                 return
 
-            # Commit and schedule push (folder-level change)
-            try:
-                highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
-                msg = f"REV {highest}"
-                self.debug(f"Commit: REV {highest}")
-                if git_commit_all(self.catalog_root, msg):
-                    rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
-                    if rc_sha == 0 and sha:
-                        self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
-                    self._schedule_git_push()
-                else:
-                    self.statusBar().showMessage("No changes to commit.", 2000)
-            except Exception:
-                pass
+            _maybe_commit_and_schedule_push()
 
             self.proxy.refresh_desc(self.current_folder)
             self.folder_created.setText(meta["Created"])
@@ -2717,7 +2723,12 @@ class CatalogWindow(QMainWindow):
         self.update_file_counter()
 
     def _schedule_git_push(self):
-        # Use settings delay; default to 60 if unset/invalid
+        if not self.settings.get("git_enabled", True):
+            self.git_push_remaining_s = None
+            self.push_label.setText("Sync push in: —")
+            self.debug("Push: skipped (git disabled)")
+            return
+
         try:
             delay = int(self.settings.get("auto_push_delay_seconds", 60))
         except Exception:
@@ -2725,7 +2736,7 @@ class CatalogWindow(QMainWindow):
         delay = max(1, delay)
 
         self.git_push_delay_s = delay
-        self.git_push_remaining_s = delay  # <-- never None here
+        self.git_push_remaining_s = delay
         self.push_label.setText(f"Sync push in: {self.git_push_remaining_s}s")
         self.debug(f"Push: scheduled in {self.git_push_remaining_s}s")
 
