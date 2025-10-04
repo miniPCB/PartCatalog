@@ -2043,6 +2043,52 @@ class CatalogWindow(QMainWindow):
         self.tabs.setVisible(not folder_mode)
         self.folder_panel.setVisible(folder_mode)
 
+    def read_folder_meta(self, folder: Path) -> dict:
+        """
+        Load <folder>/<folder>.json as the folder metadata.
+        - Returns a normalized dict with default keys if file is missing/corrupt.
+        - If missing, it will create a default JSON file on disk (best-effort).
+        """
+        meta_p = folder_meta_path(folder)
+        default = {
+            "TITLE": "",
+            "DESCRIPTION": "",
+            "Summary": "",
+            "Owner": "",
+            "Tags": [],
+            "Created": today_iso(),
+            "Last Updated": today_iso(),
+        }
+        try:
+            if meta_p.exists():
+                with meta_p.open("r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+                # normalize: start with defaults and overlay disk values
+                out = default.copy()
+                out.update(data)
+
+                # coerce Tags to list
+                tags_val = out.get("Tags", [])
+                if isinstance(tags_val, str):
+                    out["Tags"] = [t.strip() for t in tags_val.split(",") if t.strip()]
+                elif not isinstance(tags_val, list):
+                    out["Tags"] = []
+
+                # keep Created if present; ensure Last Updated exists
+                out["Created"] = (out.get("Created") or default["Created"])
+                out["Last Updated"] = out.get("Last Updated") or default["Last Updated"]
+                return out
+            else:
+                # create a default meta file (best-effort)
+                try:
+                    meta_p.write_text(json.dumps(default, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+                return default
+        except Exception:
+            # if anything goes wrong, don't crash the UI
+            return default
+
     def load_folder_meta(self, folder: Path):
         self.suppress_dirty = True
         meta = self.read_folder_meta(folder)
