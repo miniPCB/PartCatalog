@@ -590,12 +590,12 @@ class DescProxyModel(QSortFilterProxyModel):
         """
         sm = self.sourceModel()
 
-        # Populate this directory's children
-        try:
-            while sm.canFetchMore(sidx):
-                sm.fetchMore(sidx)
-        except Exception:
-            pass
+        # # Populate this directory's children
+        # try:
+        #     while sm.canFetchMore(sidx):
+        #         sm.fetchMore(sidx)
+        # except Exception:
+        #     pass
 
         rc = sm.rowCount(sidx)
         for r in range(rc):
@@ -628,7 +628,7 @@ class DescProxyModel(QSortFilterProxyModel):
         if not sidx.isValid():
             return False
 
-        # Fence: ensure this row's path is inside the canonical root
+        # Fence: only inside the canonical root
         try:
             spath = Path(sm.filePath(sidx)).resolve()
         except Exception:
@@ -636,50 +636,39 @@ class DescProxyModel(QSortFilterProxyModel):
         if not self._inside_root_path(spath):
             return False
 
-        # Force-load in case it's a folder with lazy children
-        try:
-            while sm.canFetchMore(sidx):
-                sm.fetchMore(sidx)
-        except Exception:
-            pass
-
-        # Base visibility rules first
         is_dir = sm.isDir(sidx)
         name = sm.fileName(sidx).lower()
         is_md_or_pdf = (name.endswith(".md") or name.endswith(".pdf"))
 
-        # If there is no search filter, keep original behavior:
-        # - show all folders
-        # - show only .md/.pdf files
+        # No filter → original behavior: show all folders; show only .md/.pdf files
         if not self._filter_text:
             return True if is_dir else is_md_or_pdf
 
-        # When filtering:
-        # - A row is visible if it matches itself, OR
-        # - any of its descendants match (so parents are kept open)
-        row_ok = (True if is_dir else is_md_or_pdf) and self._row_matches_filter(sidx)
-        if row_ok:
+        # WITH filter:
+        # - Always keep directories visible so their children can be loaded/displayed.
+        # - Only show files that match (by name or Description) and are .md/.pdf.
+        if is_dir:
             return True
 
-        # If directory didn't match itself, check children
-        return is_dir and self._any_child_matches(sidx)
+        return is_md_or_pdf and self._row_matches_filter(sidx)
 
-    def flags(self, index):
-        base = super().flags(index)
-        if not index.isValid():
-            return Qt.ItemIsDropEnabled
-        sidx = self.mapToSource(index)
-        sm = self.sourceModel()
-        if sm.isDir(sidx):
-            return base | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled
 
-        # Files:
-        name = sm.fileName(sidx).lower()
-        if name.endswith(".pdf"):
-            # Read-only: no drag, no drop
-            return base & ~(Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
-        # .md files can be dragged (to move) but not dropped-onto
-        return (base | Qt.ItemIsDragEnabled) & ~Qt.ItemIsDropEnabled
+        def flags(self, index):
+            base = super().flags(index)
+            if not index.isValid():
+                return Qt.ItemIsDropEnabled
+            sidx = self.mapToSource(index)
+            sm = self.sourceModel()
+            if sm.isDir(sidx):
+                return base | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled
+
+            # Files:
+            name = sm.fileName(sidx).lower()
+            if name.endswith(".pdf"):
+                # Read-only: no drag, no drop
+                return base & ~(Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
+            # .md files can be dragged (to move) but not dropped-onto
+            return (base | Qt.ItemIsDragEnabled) & ~Qt.ItemIsDropEnabled
 
     def supportedDropActions(self):
         return Qt.MoveAction
@@ -1142,7 +1131,7 @@ class CatalogWindow(QMainWindow):
         self.search_edit.setPlaceholderText("Search name or description…")
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setToolTip("Type to filter files/folders by name or the Title/Description column.")
-        self.search_edit.textChanged.connect(lambda t: self.proxy.setFilterText(t))
+        self.search_edit.textChanged.connect(self._on_search_text_changed)
         left_v.addWidget(self.search_edit, 0)
 
         self.search_edit.installEventFilter(self)
@@ -1175,6 +1164,14 @@ class CatalogWindow(QMainWindow):
 
         # Add the tree first
         left_v.addWidget(self.tree, 1)
+
+        self.tree.expand(self.tree.rootIndex())
+
+        # Debounced expand/collapse after filter changes
+        self._tree_expand_debounce = QTimer(self)
+        self._tree_expand_debounce.setSingleShot(True)
+        self._tree_expand_debounce.timeout.connect(self._apply_tree_expand_state)
+        self._want_expand_matches = False
 
         # --- Debug console (under tree) ---
         # (QPlainTextEdit is already imported at top; no extra import needed here.)
@@ -3208,6 +3205,30 @@ class CatalogWindow(QMainWindow):
             return os.path.islink(full)
         except Exception:
             return True
+
+    def _on_search_text_changed(self, text: str):
+        """Apply proxy filter and queue a safe expand/collapse."""
+        self.proxy.setFilterText(text)
+        self._want_expand_matches = bool((text or "").strip())
+        # Give the proxy a moment to finish refiltering before expanding/collapsing.
+        self._tree_expand_debounce.start(120)
+
+    def _apply_tree_expand_state(self):
+        """Runs after debounce so UI expansion doesn't race with filtering."""
+        try:
+            self.tree.setUpdatesEnabled(False)
+            self.tree.blockSignals(True)
+            if self._want_expand_matches:
+                # Open all branches so every hit is visible
+                self.tree.expandAll()
+            else:
+                # Back to a tidy tree when filter cleared
+                self.tree.collapseAll()
+                self.tree.expand(self.tree.rootIndex())
+        finally:
+            self.tree.blockSignals(False)
+            self.tree.setUpdatesEnabled(True)
+
 
 # ---------- Boot ---------------------------------------------------------------
 def ensure_catalog_root(start_dir: Path | None = None) -> Path:
