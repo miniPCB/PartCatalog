@@ -505,19 +505,164 @@ def make_emoji_icon(emoji: str, px: int = 256) -> QIcon:
 
 # ---------- Proxy model for tree ---------------------------------------------
 class DescProxyModel(QSortFilterProxyModel):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, parent=None, root_path: Path | None = None):
+        super().__init__(parent)
+        self._filter_text = ""
+        # Canonical, resolved root (defaults to the script folder)
+        self._root = (Path(root_path).resolve()
+                      if root_path is not None
+                      else Path(__file__).resolve().parent)
+
         self._desc_cache = {}
+
+    def _inside_root_path(self, p: Path) -> bool:
+        try:
+            p.resolve().relative_to(self._root)
+            return True
+        except Exception:
+            return False
+
+    # ---- search text API ----
+    def setFilterText(self, text: str):
+        t = (text or "").strip().lower()
+        if t == self._filter_text:
+            return
+        self._filter_text = t
+        self.invalidateFilter()
+
+    def _desc_for_index(self, sidx) -> str:
+        """
+        Return the Description string for this source index (folder title or MD Title),
+        but only if the path is inside the script's root directory. Symlinks that resolve
+        outside the root are ignored.
+        """
+        sm = self.sourceModel()
+
+        # Resolve the filesystem path for the row
+        try:
+            spath = Path(sm.filePath(sidx)).resolve()
+        except Exception:
+            return ""
+
+        # Determine the hard root (prefer a root passed to the proxy; fall back to script dir)
+        try:
+            root = getattr(self, "_root", None)
+            if root is None:
+                root = Path(__file__).resolve().parent
+            root = Path(root).resolve()
+        except Exception:
+            return ""
+
+        # Fence: skip anything outside the root (including symlinks that point out)
+        try:
+            spath.relative_to(root)
+        except ValueError:
+            return ""
+
+        # Normal behavior (unchanged)
+        try:
+            if spath.is_dir():
+                return self._read_folder_title(spath) or ""
+            name = spath.name.lower()
+            if name.endswith(".md"):
+                return self._read_title_from_md(spath) or ""
+            # PDFs show as read-only; description isn't needed for search
+            return ""
+        except Exception:
+            return ""
+
+    def _row_matches_filter(self, sidx) -> bool:
+        """True if current row name or description contains the filter text."""
+        if not self._filter_text:
+            return True  # no filter → everything allowed by base rules
+        sm = self.sourceModel()
+        name = (sm.fileName(sidx) or "").lower()
+        if self._filter_text in name:
+            return True
+        desc = (self._desc_for_index(sidx) or "").lower()
+        return self._filter_text in desc
+
+    def _any_child_matches(self, sidx) -> bool:
+        """
+        Returns True if any descendant matches. Ensures children are populated
+        even when folders are collapsed by explicitly calling fetchMore().
+        Also fences all traversal to self._root.
+        """
+        sm = self.sourceModel()
+
+        # Populate this directory's children
+        try:
+            while sm.canFetchMore(sidx):
+                sm.fetchMore(sidx)
+        except Exception:
+            pass
+
+        rc = sm.rowCount(sidx)
+        for r in range(rc):
+            child = sm.index(r, 0, sidx)
+            if not child.isValid():
+                continue
+
+            # Fence: skip anything outside root (incl. symlinks that resolve out)
+            try:
+                cpath = Path(sm.filePath(child)).resolve()
+            except Exception:
+                continue
+            if not self._inside_root_path(cpath):
+                continue
+
+            if self._row_matches_filter(child):
+                return True
+
+            try:
+                if sm.isDir(child) and self._any_child_matches(child):
+                    return True
+            except Exception:
+                continue
+
+        return False
 
     def filterAcceptsRow(self, source_row, source_parent):
         sm = self.sourceModel()
-        idx = sm.index(source_row, 0, source_parent)
-        if not idx.isValid():
+        sidx = sm.index(source_row, 0, source_parent)
+        if not sidx.isValid():
             return False
-        if sm.isDir(idx):
+
+        # Fence: ensure this row's path is inside the canonical root
+        try:
+            spath = Path(sm.filePath(sidx)).resolve()
+        except Exception:
+            return False
+        if not self._inside_root_path(spath):
+            return False
+
+        # Force-load in case it's a folder with lazy children
+        try:
+            while sm.canFetchMore(sidx):
+                sm.fetchMore(sidx)
+        except Exception:
+            pass
+
+        # Base visibility rules first
+        is_dir = sm.isDir(sidx)
+        name = sm.fileName(sidx).lower()
+        is_md_or_pdf = (name.endswith(".md") or name.endswith(".pdf"))
+
+        # If there is no search filter, keep original behavior:
+        # - show all folders
+        # - show only .md/.pdf files
+        if not self._filter_text:
+            return True if is_dir else is_md_or_pdf
+
+        # When filtering:
+        # - A row is visible if it matches itself, OR
+        # - any of its descendants match (so parents are kept open)
+        row_ok = (True if is_dir else is_md_or_pdf) and self._row_matches_filter(sidx)
+        if row_ok:
             return True
-        name = sm.fileName(idx).lower()
-        return name.endswith(".md") or name.endswith(".pdf")
+
+        # If directory didn't match itself, check children
+        return is_dir and self._any_child_matches(sidx)
 
     def flags(self, index):
         base = super().flags(index)
@@ -888,6 +1033,11 @@ class CatalogWindow(QMainWindow):
 
         # Dirty / autosave
         self.dirty = False
+
+        self._md_total_cached: int | None = None
+        self._md_total_cached_when: float = 0.0  # monotonic seconds
+        self._md_total_min_interval_s: float = 8.0
+
         # Review tab dirty flag
         self.review_dirty = False
         self.suppress_dirty = False
@@ -975,7 +1125,7 @@ class CatalogWindow(QMainWindow):
         except Exception:
             pass
 
-        self.proxy = DescProxyModel(self)
+        self.proxy = DescProxyModel(self, root_path=self.catalog_root)
         self.proxy.setSourceModel(self.fs_model)
 
         # ===== LEFT PANE: tree + debug console + footer =====
@@ -983,6 +1133,19 @@ class CatalogWindow(QMainWindow):
         left_v = QVBoxLayout(left_container)
         left_v.setContentsMargins(0, 0, 0, 0)
         left_v.setSpacing(4)
+
+        # --- lock root to the folder containing this script ---
+        self._script_root = self.catalog_root.resolve()
+
+        # --- Search (filters the file tree by Name or Description) ---
+        self.search_edit = QLineEdit(self)
+        self.search_edit.setPlaceholderText("Search name or description…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setToolTip("Type to filter files/folders by name or the Title/Description column.")
+        self.search_edit.textChanged.connect(lambda t: self.proxy.setFilterText(t))
+        left_v.addWidget(self.search_edit, 0)
+
+        self.search_edit.installEventFilter(self)
 
         # --- Tree ---
         self.tree = QTreeView(self)
@@ -1914,11 +2077,32 @@ class CatalogWindow(QMainWindow):
         self.git_push_remaining_s -= 1
 
     # ---------- File counter helpers -------------------------------------------
-    def _count_md_recursive(self, folder: Path) -> int:
+    def _count_md_recursive(self, folder: Path, max_dirs: int = 5000, time_budget_s: float = 0.4) -> int:
+        """
+        Count *.md files quickly:
+        - Prune heavy/hidden/VCS/build dirs.
+        - Skip symlinked directories.
+        - Hard cap the number of directories and wall-clock time.
+        Returns the best-effort count; safe to call on the UI thread.
+        """
+        start = datetime.datetime.now().timestamp()
         cnt = 0
+        visited_dirs = 0
         try:
-            for root, _, files in os.walk(folder):
-                cnt += sum(1 for f in files if f.lower().endswith(".md"))
+            for root, dirnames, files in os.walk(folder, followlinks=False):
+                # Prune dirs in-place (fast; prevents descending)
+                dirnames[:] = [d for d in dirnames if not self._should_skip_dir(root, d)]
+                visited_dirs += 1
+                # Bounds to keep UI responsive
+                if visited_dirs >= max_dirs:
+                    break
+                if (datetime.datetime.now().timestamp() - start) >= time_budget_s:
+                    break
+                # Count md files in this directory
+                for f in files:
+                    # quick check without lower(); avoids per-file alloc in large folders
+                    if f.endswith(".md") or f.endswith(".MD") or f.endswith(".Md") or f.endswith(".mD"):
+                        cnt += 1
         except Exception:
             pass
         return cnt
@@ -1930,13 +2114,28 @@ class CatalogWindow(QMainWindow):
             return 0
 
     def update_file_counter(self):
-        root_total = self._count_md_recursive(self.catalog_root)
+        # Current-folder count: shallow and cheap
         sp = self.selected_path()
         folder = sp if (sp and sp.is_dir()) else (sp.parent if (sp and sp.is_file()) else self.catalog_root)
         in_folder = self._count_md_shallow(folder)
+
+        # Repo-wide total: cached + throttled
+        try:
+            import time
+            now = time.monotonic()
+            if (
+                self._md_total_cached is None
+                or (now - self._md_total_cached_when) >= self._md_total_min_interval_s
+            ):
+                self._md_total_cached = self._count_md_recursive(self.catalog_root)
+                self._md_total_cached_when = now
+            root_total = self._md_total_cached
+        except Exception:
+            root_total = 0
+
         self.counter_label.setText(f"Files in folder: {in_folder} | Total: {root_total}")
 
-    # ---------- UI / selection helpers -----------------------------------------
+        # ---------- UI / selection helpers -----------------------------------------
     def show_file_ui(self, file_selected: bool):
         self.tabs.setVisible(file_selected)
         self.folder_panel.setVisible(not file_selected)  # intentional mistake for testing
@@ -2983,6 +3182,32 @@ class CatalogWindow(QMainWindow):
         if rev and rev != "-":
             return f"{pn}, REV {rev}"
         return pn
+
+    def eventFilter(self, obj, ev):
+        try:
+            from PyQt5.QtCore import QEvent
+            if obj is getattr(self, "search_edit", None) and ev.type() == QEvent.KeyPress:
+                from PyQt5.QtGui import QKeySequence
+                if ev.key() == Qt.Key_Escape:
+                    self.search_edit.clear()
+                    return True
+        except Exception:
+            pass
+        return super().eventFilter(obj, ev)
+
+    def _should_skip_dir(self, parent: str, d: str) -> bool:
+        skip_dirs = {
+            ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
+            ".ruff_cache", "node_modules", "build", "dist", ".venv", "venv"
+        }
+        if d in skip_dirs or d.startswith("."):
+            return True
+        # Skip symlinked directories entirely (often point outside the tree)
+        try:
+            full = os.path.join(parent, d)
+            return os.path.islink(full)
+        except Exception:
+            return True
 
 # ---------- Boot ---------------------------------------------------------------
 def ensure_catalog_root(start_dir: Path | None = None) -> Path:
