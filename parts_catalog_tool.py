@@ -2433,19 +2433,30 @@ class CatalogWindow(QMainWindow):
 
                 # Commit and schedule push (if allowed)
                 if allow_commit_push and bool(self.settings.get("git_enabled", True)):
+                    # Commit and schedule push (this file only)
                     try:
                         highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
-                        msg = f"REV {highest}"
-                        self.debug(f"Commit: {msg}")
-                        if git_commit_all(self.catalog_root, msg):
-                            rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
-                            if rc_sha == 0 and sha:
-                                self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
-                            self._schedule_git_push()
-                        else:
+                        msg = self._commit_msg_for_file(self.current_path, highest)
+                        # Stage and commit ONLY the current file
+                        _git(self.catalog_root, "add", str(self.current_path))
+                        rc_chk, _, _ = _git(self.catalog_root, "diff", "--cached", "--quiet", "--", str(self.current_path))
+                        if rc_chk == 0:
+                            # No staged change for this path → nothing to commit
                             self.statusBar().showMessage("No changes to commit.", 2000)
-                    except Exception:
-                        pass
+                            self.debug("Commit: no changes (file-specific)")
+                        else:
+                            self.debug(f"Commit (file): {self.current_path.name} → {msg}")
+                            rc_c, _, err_c = _git(self.catalog_root, "commit", "-m", msg, "--", str(self.current_path))
+                            if rc_c == 0:
+                                rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
+                                if rc_sha == 0 and sha:
+                                    self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
+                                self._schedule_git_push()
+                            else:
+                                self.statusBar().showMessage(f"Commit failed: {err_c or 'unknown error'}", 5000)
+                                self.debug(f"Commit: fail → {err_c or 'unknown error'}")
+                    except Exception as ex:
+                        self.debug(f"Commit: exception → {ex!r}")
                 else:
                     # Either git disabled or pull failed → skip commit/push
                     if bool(self.settings.get("git_enabled", True)) and not allow_commit_push:
@@ -2546,22 +2557,29 @@ class CatalogWindow(QMainWindow):
             except Exception as e:
                 self.error("Error", f"Failed to save folder metadata:\n{e}")
                 return
+            # Commit and schedule push (folder metadata JSON only)
+            try:
+                meta_p = folder_meta_path(self.current_folder)
+                msg = f"Folder '{self.current_folder.name}' metadata updated"
 
-            # Commit and schedule push (if allowed)
-            if allow_commit_push and bool(self.settings.get("git_enabled", True)):
-                try:
-                    highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
-                    msg = f"REV {highest}"
-                    self.debug(f"Commit: {msg}")
-                    if git_commit_all(self.catalog_root, msg):
+                _git(self.catalog_root, "add", str(meta_p))
+                rc_chk, _, _ = _git(self.catalog_root, "diff", "--cached", "--quiet", "--", str(meta_p))
+                if rc_chk == 0:
+                    self.statusBar().showMessage("No changes to commit.", 2000)
+                    self.debug("Commit: no changes (folder meta)")
+                else:
+                    self.debug(f"Commit (folder meta): {meta_p.name} → {msg}")
+                    rc_c, _, err_c = _git(self.catalog_root, "commit", "-m", msg, "--", str(meta_p))
+                    if rc_c == 0:
                         rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
                         if rc_sha == 0 and sha:
                             self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
                         self._schedule_git_push()
                     else:
-                        self.statusBar().showMessage("No changes to commit.", 2000)
-                except Exception:
-                    pass
+                        self.statusBar().showMessage(f"Commit failed: {err_c or 'unknown error'}", 5000)
+                        self.debug(f"Commit: fail → {err_c or 'unknown error'}")
+            except Exception as ex:
+                self.debug(f"Commit: exception → {ex!r}")
             else:
                 if bool(self.settings.get("git_enabled", True)) and not allow_commit_push:
                     self.debug("Commit: skipped due to pre-save pull failure/conflict")
@@ -2896,6 +2914,29 @@ class CatalogWindow(QMainWindow):
             return
 
         self.info("Archive", f"Created: {dest_zip}")
+
+    def _commit_msg_for_file(self, file_path: Path, highest_rev: str | None) -> str:
+        """
+        Build a per-file commit message like 'PN-123, REV A'.
+        Fallback subject:
+        - '.md' and '.pdf' files → 'Document'
+        - everything else → 'System File'
+        """
+        # Try the PN from the Introduction form
+        pn = ""
+        try:
+            pn = (self.field_widgets.get("Part Number").text() or "").strip()
+        except Exception:
+            pn = ""
+
+        if not pn:
+            ext = (file_path.suffix or "").lower()
+            pn = "Document" if ext in (".md", ".pdf") else "System File"
+
+        rev = (highest_rev or "").strip() if highest_rev is not None else ""
+        if rev and rev != "-":
+            return f"{pn}, REV {rev}"
+        return pn
 
 # ---------- Boot ---------------------------------------------------------------
 def ensure_catalog_root(start_dir: Path | None = None) -> Path:
