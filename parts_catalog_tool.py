@@ -2191,7 +2191,7 @@ class CatalogWindow(QMainWindow):
         self.rev_table.insertRow(r)
         defaults = ["", today_iso(), "", self._default_owner_for_context()]
         if r == 0:
-            defaults = ["-", today_iso(), "initial release", self._default_owner_for_context()]
+            defaults = ["-", today_iso(), "Initial release", self._default_owner_for_context()]
         for c, val in enumerate(defaults):
             self.rev_table.setItem(r, c, QTableWidgetItem(val))
 
