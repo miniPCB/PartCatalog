@@ -3351,10 +3351,6 @@ class CatalogWindow(QMainWindow):
             # Never crash the UI because of the label
             self.git_mode_label.setText("Git: Full")
 
-    def _current_branch(self) -> str:
-        br = (self.settings.get("git_branch") or "main").strip() or "main"
-        return br
-
     def _ahead_behind_dirty(self) -> tuple[int, int, bool]:
         """
         Return (behind_cnt, ahead_cnt, dirty_worktree).
@@ -3418,13 +3414,7 @@ class CatalogWindow(QMainWindow):
         return (rc == 0 and out.strip() == relpath)
 
     def sync_repo(self):
-        """
-        User-initiated sync:
-        - FULL mode: per-file newest-wins (fetch, decide per path, commit, push, pull --rebase).
-        - LOCAL_ONLY or OFF (or git_enabled=False): local-only consolidate; stage and commit working tree.
-        Always runs in background and updates footer when done.
-        """
-        # Ensure a repo exists so local commits can work even if git was off at startup.
+        # Ensure repo exists for local commits regardless of mode
         try:
             ensure_git_repo(self.catalog_root, self.settings)
         except Exception:
@@ -3434,8 +3424,10 @@ class CatalogWindow(QMainWindow):
         if mode == GitMode.FULL and self.settings.get("git_enabled", True):
             self._gitbg.submit(self._bg_sync_repo_full)
         else:
+            if mode != GitMode.FULL or not self.settings.get("git_enabled", True):
+                self._gitbg.ui(lambda: self.statusBar().showMessage(
+                    "Network sync disabled (Git not Full). Doing local consolidate…", 4000))
             self._gitbg.submit(self._bg_sync_repo_local_only)
-
 
     # ---------------- INTERNALS ----------------
 
@@ -3467,7 +3459,6 @@ class CatalogWindow(QMainWindow):
         except Exception as ex:
             self.debug(f"Sync (local-only): exception → {ex!r}")
             self._gitbg.ui(lambda: self.statusBar().showMessage("Local sync failed (exception).", 5000))
-
 
     def _bg_sync_repo_full(self):
         """Full newest-wins sync vs origin/<branch>, then push and pull --rebase."""
@@ -3562,20 +3553,51 @@ class CatalogWindow(QMainWindow):
                     self._gitbg.ui(self.update_file_counter)
                     return
 
-            # 4) Push, then pull --rebase to ensure final alignment
-            rc_p, _, err_p = _git(self.catalog_root, "push", "origin", f"HEAD:{branch}")
-            if rc_p == -999:
-                self._handle_git_timeout("Push")
-                # local-only fallback is already committed; just stop here
+            # 4) Decide whether to push even if no new commit happened
+            if not self._has_origin():
+                self.debug("Sync: no 'origin' remote; skipping push/pull")
                 self._gitbg.ui(self.update_file_counter)
                 return
-            if rc_p != 0:
-                self.debug(f"Sync: push failed → {err_p or 'unknown error'}")
-                self._gitbg.ui(lambda: self.statusBar().showMessage("Sync push failed.", 5000))
-            else:
+
+            # Refresh ahead/behind quickly (fetch already done above)
+            behind, ahead, dirty = self._ahead_behind_dirty()
+
+            # If we're ahead, push (even when no new commit was created in step 3)
+            if ahead > 0:
+                # First push may need -u to set upstream
+                push_args = ["push", "origin", f"HEAD:{branch}"]
+                if not self._has_upstream():
+                    push_args = ["push", "-u", "origin", f"HEAD:{branch}"]
+
+                rc_p, _, err_p = _git(self.catalog_root, *push_args)
+                if rc_p == -999:
+                    self._handle_git_timeout("Push")
+                    self._gitbg.ui(self.update_file_counter)
+                    return
+                if rc_p != 0:
+                    self.debug(f"Sync: push failed → {err_p or 'unknown error'}")
+                    self._gitbg.ui(lambda: self.statusBar().showMessage("Sync push failed.", 5000))
+                    self._gitbg.ui(self.update_file_counter)
+                    return
+
+                # Pull (fast-forward/rebase) to ensure full alignment after push
                 _git(self.catalog_root, "pull", "--rebase", "--autostash", "origin", branch)
                 self._gitbg.ui(lambda: self.statusBar().showMessage("Sync complete.", 3000))
+            else:
+                # Not ahead: we might still be behind
+                if behind > 0:
+                    rc_pull, _, err_pull = _git(self.catalog_root, "pull", "--rebase", "--autostash", "origin", branch)
+                    if rc_pull == -999:
+                        self._handle_git_timeout("Pull")
+                    elif rc_pull != 0:
+                        self.debug(f"Sync: pull failed → {err_pull or 'unknown error'}")
+                        self._gitbg.ui(lambda: self.statusBar().showMessage("Sync pull failed.", 5000))
+                    else:
+                        self._gitbg.ui(lambda: self.statusBar().showMessage("Sync complete.", 3000))
+                else:
+                    self._gitbg.ui(lambda: self.statusBar().showMessage("Already synchronized.", 2000))
 
+            # Update the footer + summary
             self._gitbg.ui(self.update_file_counter)
             if took_remote or kept_local or removed_local or staged_new:
                 self.debug(
@@ -3584,14 +3606,26 @@ class CatalogWindow(QMainWindow):
                     f"removed_local={len(removed_local)}, staged_new={len(staged_new)}"
                 )
             self.debug("Sync (full): done")
+
         except Exception as ex:
             self.debug(f"Sync (full): exception → {ex!r}")
             self._gitbg.ui(lambda: self.statusBar().showMessage("Sync failed (exception).", 5000))
             self._gitbg.ui(self.update_file_counter)
 
+    def _has_origin(self) -> bool:
+        rc, remotes, _ = _git(self.catalog_root, "remote")
+        return (rc == 0 and "origin" in (remotes or "").splitlines())
+
     def _current_branch(self) -> str:
-        br = (self.settings.get("git_branch") or "main").strip() or "main"
-        return br
+        # Prefer actual HEAD branch; fall back to settings
+        rc, out, _ = _git(self.catalog_root, "rev-parse", "--abbrev-ref", "HEAD")
+        if rc == 0 and out.strip() and out.strip() != "HEAD":
+            return out.strip()
+        return (self.settings.get("git_branch") or "main").strip() or "main"
+
+    def _has_upstream(self) -> bool:
+        rc, _, _ = _git(self.catalog_root, "rev-parse", "--symbolic-full-name", "--abbrev-ref", "@{u}")
+        return (rc == 0)
 
     def _path_last_commit_ts(self, rev: str, relpath: str) -> int | None:
         rc, out, _ = _git(self.catalog_root, "log", "-1", "--format=%ct", rev, "--", relpath)
