@@ -122,10 +122,23 @@ from PyQt5.QtWidgets import (
     QLineEdit, QHeaderView, QPushButton, QSpacerItem, QSizePolicy,
     QGroupBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QStyleFactory, QStyledItemDelegate, QFormLayout, QPlainTextEdit,
-    QDialog, QDialogButtonBox, QSpinBox, QCheckBox
+    QDialog, QDialogButtonBox, QSpinBox, QCheckBox, QComboBox
 )
 from PyQt5.QtWidgets import QAction as QtAction
 
+from enum import IntEnum
+
+class GitMode(IntEnum):
+    OFF = 0          # no git at all
+    LOCAL_ONLY = 1   # commit/index allowed; no network (no pull/push)
+    FULL = 2         # pull/push allowed
+
+def git_mode_from_settings(s: dict) -> GitMode:
+    val = s.get("git_mode", GitMode.FULL)
+    try:
+        return GitMode(int(val))
+    except Exception:
+        return GitMode.FULL
 
 # ---------- Settings (high-level app config) -----------------------------------
 def _script_dir() -> Path:
@@ -156,7 +169,9 @@ DEFAULT_SETTINGS = {
     "git_branch": "main",              # default branch to pull/push
     "auto_push_delay_seconds": 60,     # countdown refreshed after each save
     "show_debug_console": True,
-    "git_enabled": True         
+    "git_enabled": True,
+    "git_mode": 2                      # 0=OFF, 1=LOCAL_ONLY, 2=FULL
+
 }
 
 def load_settings() -> dict:
@@ -194,6 +209,8 @@ def save_settings(s: dict):
         pass
 
 # ---------- Git helpers (no UI) -----------------------------------------------
+GIT_TIMEOUT_S = 3  # default wall-clock timeout for git subcommands
+
 def _run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
     _dbg(f"GIT RUN: {' '.join(shlex.quote(x) for x in cmd)}  (cwd={cwd})")
     try:
@@ -208,7 +225,16 @@ def _run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=env
         )
-        out, err = p.communicate()
+
+        try:
+            out, err = p.communicate(timeout=GIT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            return -999, "", "timeout"
+
         rc = p.returncode
         _dbg(f"GIT EXIT {rc} | out: {_clip(out)} | err: {_clip(err)}")
         return rc, (out or "").strip(), (err or "").strip()
@@ -257,8 +283,11 @@ def _highest_rev_from_table(rev_table) -> str:
         pass
     return "-"
 
-def git_commit_all(repo_root: Path, message: str) -> bool:
-    _git(repo_root, "add", "-A")
+def git_commit_paths(repo_root: Path, message: str, paths: list[Path]) -> bool:
+    if not paths:
+        return False
+    for p in paths:
+        _git(repo_root, "add", str(p))
     rc, _, _ = _git(repo_root, "diff", "--cached", "--quiet")
     if rc == 0:
         return False
@@ -640,35 +669,31 @@ class DescProxyModel(QSortFilterProxyModel):
         name = sm.fileName(sidx).lower()
         is_md_or_pdf = (name.endswith(".md") or name.endswith(".pdf"))
 
-        # No filter → original behavior: show all folders; show only .md/.pdf files
+        # No filter → show all dirs; only .md/.pdf files
         if not self._filter_text:
             return True if is_dir else is_md_or_pdf
 
-        # WITH filter:
-        # - Always keep directories visible so their children can be loaded/displayed.
-        # - Only show files that match (by name or Description) and are .md/.pdf.
+        # With filter: keep dirs visible; filter files by name/desc and ext
         if is_dir:
             return True
-
         return is_md_or_pdf and self._row_matches_filter(sidx)
 
+    def flags(self, index):
+        base = super().flags(index)
+        if not index.isValid():
+            return Qt.ItemIsDropEnabled
+        sidx = self.mapToSource(index)
+        sm = self.sourceModel()
+        if sm.isDir(sidx):
+            return base | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled
 
-        def flags(self, index):
-            base = super().flags(index)
-            if not index.isValid():
-                return Qt.ItemIsDropEnabled
-            sidx = self.mapToSource(index)
-            sm = self.sourceModel()
-            if sm.isDir(sidx):
-                return base | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled
-
-            # Files:
-            name = sm.fileName(sidx).lower()
-            if name.endswith(".pdf"):
-                # Read-only: no drag, no drop
-                return base & ~(Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
-            # .md files can be dragged (to move) but not dropped-onto
-            return (base | Qt.ItemIsDragEnabled) & ~Qt.ItemIsDropEnabled
+        # Files:
+        name = sm.fileName(sidx).lower()
+        if name.endswith(".pdf"):
+            # Read-only: no drag, no drop
+            return base & ~(Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
+        # .md files can be dragged (to move) but not dropped-onto
+        return (base | Qt.ItemIsDragEnabled) & ~Qt.ItemIsDropEnabled
 
     def supportedDropActions(self):
         return Qt.MoveAction
@@ -867,10 +892,22 @@ class SettingsToolsDialog(QDialog):
         sf.addRow("Git Remote (origin):", self.git_remote)
         sf.addRow("Git Branch:", self.git_branch)
         sf.addRow("Push Delay (sec):", self.push_delay)
-        # Enable/disable Git entirely
-        self.git_enabled_cb = QCheckBox("Enable Git (pull / commit / push)", self)
-        self.git_enabled_cb.setChecked(bool(self.settings.get("git_enabled", True)))
-        sf.addRow(self.git_enabled_cb)
+
+        # # Enable/disable Git entirely
+        # self.git_enabled_cb = QCheckBox("Enable Git (pull / commit / push)", self)
+        # self.git_enabled_cb.setChecked(bool(self.settings.get("git_enabled", True)))
+        # sf.addRow(self.git_enabled_cb)
+
+        # Git Mode selector
+        self.git_mode_combo = QComboBox(self)
+        self.git_mode_combo.addItems(["Off (no Git)", "Local-Only (no pull/push)", "Full (pull/push)"])
+        try:
+            mode_idx = int(self.settings.get("git_mode", 2))
+            if mode_idx < 0 or mode_idx > 2: mode_idx = 2
+        except Exception:
+            mode_idx = 2
+        self.git_mode_combo.setCurrentIndex(mode_idx)
+        sf.addRow("Git Mode:", self.git_mode_combo)
 
         sf.addRow("Default Owner Name:", self.owner_default)
         sf.addRow("New File Prefix:", self.prefix)
@@ -938,7 +975,9 @@ class SettingsToolsDialog(QDialog):
         out["file_name_prefix"] = self.prefix.text().strip()
         out["number_width"] = int(self.width.value())
         out["schematic_folder"] = self.schematic_folder_edit.text().strip()
-        out["git_enabled"] = bool(self.git_enabled_cb.isChecked())
+        out["git_mode"] = int(self.git_mode_combo.currentIndex())
+        # retain legacy flag for backward-compat (kept in sync)
+        out["git_enabled"] = (out["git_mode"] != 0)
         return out
 
 # ---------- Background Git queue (non-blocking) -------------------------------
@@ -1083,6 +1122,12 @@ class CatalogWindow(QMainWindow):
         self.act_zoom_reset.triggered.connect(self.reset_zoom)
         tb.addAction(self.act_zoom_in); tb.addAction(self.act_zoom_out); tb.addAction(self.act_zoom_reset)
 
+        # --- Sync Repo button ---
+        self.act_sync = QtAction("Sync Repo", self)
+        self.act_sync.setToolTip("Push local newer files, pull remote newer files (per-file by last edit time)")
+        self.act_sync.triggered.connect(self.sync_repo)
+        tb.addAction(self.act_sync)
+
         # Right-aligned autosave countdown label
         spacer = QWidget(self); spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); tb.addWidget(spacer)
         self.autosave_label = QLabel("Autosave in: —", self)
@@ -1101,6 +1146,12 @@ class CatalogWindow(QMainWindow):
         self.push_label = QLabel("Sync push in: —", self)
         self.push_label.setStyleSheet("color:#A0A6AD; padding: 0 6px;")
         tb.addWidget(self.push_label)
+
+        self.git_mode_label = QLabel("Git: —", self)
+        self.git_mode_label.setStyleSheet("color:#A0A6AD; padding: 0 6px;")
+        tb.addWidget(self.git_mode_label)
+
+        self.refresh_git_mode_label()
 
         # File system model / proxy
         self.fs_model = QFileSystemModel(self)
@@ -1391,7 +1442,8 @@ class CatalogWindow(QMainWindow):
         self.update_file_counter()
 
         # --- Git: init quickly, then pull in background ---
-        if self.settings.get("git_enabled", True):
+        mode = git_mode_from_settings(self.settings)
+        if self.settings.get("git_enabled", True) and mode == GitMode.FULL:
             try:
                 ensure_git_repo(self.catalog_root, self.settings)
             except Exception:
@@ -1410,7 +1462,7 @@ class CatalogWindow(QMainWindow):
 
             self._gitbg.submit(_bg_pull)
         else:
-            self.debug("Git: disabled")
+            self.debug(f"Git: startup pull skipped (git_mode={mode.name})")
             self.push_label.setText("Sync push in: —")
             self.git_push_remaining_s = None
         
@@ -1451,6 +1503,7 @@ class CatalogWindow(QMainWindow):
         if dlg.exec_() == QDialog.Accepted:
             self.settings = dlg.result_settings()
             save_settings(self.settings)
+            self.refresh_git_mode_label()
             if self.settings.get("git_enabled", True):
                 try:
                     ensure_git_repo(self.catalog_root, self.settings)
@@ -1619,6 +1672,7 @@ class CatalogWindow(QMainWindow):
         stats["last_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
         self.settings["stats"] = stats
         save_settings(self.settings)
+        self.refresh_git_mode_label()
 
     def _default_owner_for_context(self) -> str:
         s_owner = (self.settings.get("owner_default_name") or "").strip()
@@ -1640,6 +1694,7 @@ class CatalogWindow(QMainWindow):
             c[prefix] = 0
             self.settings["last_file_counters"] = c
             save_settings(self.settings)
+            self.refresh_git_mode_label()
         return c[prefix]
 
     def _set_counter_for_prefix(self, prefix: str, value: int):
@@ -1647,6 +1702,7 @@ class CatalogWindow(QMainWindow):
         c[prefix] = max(0, int(value))
         self.settings["last_file_counters"] = c
         save_settings(self.settings)
+        self.refresh_git_mode_label()
 
     def _extract_number_from_name(self, prefix: str, name_no_ext: str):
         if not name_no_ext.startswith(prefix):
@@ -2021,8 +2077,9 @@ class CatalogWindow(QMainWindow):
                     self.autosave_remaining_s -= 1
 
         # ---------- GIT PUSH COUNTDOWN ----------
-        # If Git is disabled, keep the label static and skip all countdown/push logic.
-        if not self.settings.get("git_enabled", True):
+        # Respect both the legacy flag and the new Git Mode. If not FULL, keep label static.
+        mode = git_mode_from_settings(self.settings)
+        if (not self.settings.get("git_enabled", True)) or (mode != GitMode.FULL):
             self.push_label.setText("Sync push in: —")
             self.git_push_remaining_s = None
             return
@@ -2044,10 +2101,22 @@ class CatalogWindow(QMainWindow):
                 try:
                     self._push_inflight = True
                     self._gitbg.ui(lambda: self.push_label.setText("Pushing…"))
+
+                    # Re-check mode at execution time
+                    _mode = git_mode_from_settings(self.settings)
+                    if _mode != GitMode.FULL:
+                        self._gitbg.ui(lambda: self.push_label.setText("Sync push in: —"))
+                        self.debug(f"Push: canceled (git mode={_mode.name})")
+                        return
+
                     branch = (self.settings.get("git_branch") or "main")
                     self.debug(f"Push: start → branch={branch}")
+
                     rc, out, err = _git(self.catalog_root, "push", "origin", f"HEAD:{branch}")
-                    if rc == 0:
+                    if rc == -999:
+                        # Timeout → flip to Local-Only and surface a gentle notice
+                        self._handle_git_timeout("Push")
+                    elif rc == 0:
                         rc2, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
                         sha_msg = f" ({sha})" if (rc2 == 0 and sha) else ""
                         self.debug(f"Push: ok{sha_msg}")
@@ -2130,7 +2199,8 @@ class CatalogWindow(QMainWindow):
         except Exception:
             root_total = 0
 
-        self.counter_label.setText(f"Files in folder: {in_folder} | Total: {root_total}")
+        state_txt = self._sync_state_text()  # "Synchronized", "Out of Sync (ahead/behind/complex)"
+        self.counter_label.setText(f"Files in folder: {in_folder} | Total: {root_total}; {state_txt}")
 
         # ---------- UI / selection helpers -----------------------------------------
     def show_file_ui(self, file_selected: bool):
@@ -2648,7 +2718,10 @@ class CatalogWindow(QMainWindow):
         allow_commit_push = True
 
         # Only attempt a pre-save pull when we’re saving something real (file or folder)
-        something_selected = (self.current_path and self.current_path.is_file()) or (self.current_folder and self.current_folder.is_dir())
+        something_selected = (
+            (self.current_path and self.current_path.is_file()) or
+            (self.current_folder and self.current_folder.is_dir())
+        )
         if something_selected:
             ok_to_commit = self._safe_pull_before_save()
             if not ok_to_commit:
@@ -2675,11 +2748,10 @@ class CatalogWindow(QMainWindow):
 
                 # Commit and schedule push (if allowed)
                 if allow_commit_push and bool(self.settings.get("git_enabled", True)):
-                    # Commit and schedule push (this file only)
                     try:
                         highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
                         msg = self._commit_msg_for_file(self.current_path, highest)
-                        # Stage and commit ONLY the current file
+                        # Stage and commit ONLY the current file (path-scoped)
                         _git(self.catalog_root, "add", str(self.current_path))
                         rc_chk, _, _ = _git(self.catalog_root, "diff", "--cached", "--quiet", "--", str(self.current_path))
                         if rc_chk == 0:
@@ -2689,7 +2761,9 @@ class CatalogWindow(QMainWindow):
                         else:
                             self.debug(f"Commit (file): {self.current_path.name} → {msg}")
                             rc_c, _, err_c = _git(self.catalog_root, "commit", "-m", msg, "--", str(self.current_path))
-                            if rc_c == 0:
+                            if rc_c == -999:
+                                self._handle_git_timeout("Commit")
+                            elif rc_c == 0:
                                 rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
                                 if rc_sha == 0 and sha:
                                     self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
@@ -2754,17 +2828,27 @@ class CatalogWindow(QMainWindow):
             if allow_commit_push and bool(self.settings.get("git_enabled", True)):
                 try:
                     highest = _highest_rev_from_table(self.rev_table) if hasattr(self, "rev_table") else "-"
-                    msg = f"REV {highest}"
-                    self.debug(f"Commit: {msg}")
-                    if git_commit_all(self.catalog_root, msg):
-                        rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
-                        if rc_sha == 0 and sha:
-                            self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
-                        self._schedule_git_push()
-                    else:
+                    msg = self._commit_msg_for_file(self.current_path, highest)
+                    self.debug(f"Commit (file): {self.current_path.name} → {msg}")
+                    _git(self.catalog_root, "add", str(self.current_path))
+                    rc_chk, _, _ = _git(self.catalog_root, "diff", "--cached", "--quiet", "--", str(self.current_path))
+                    if rc_chk == 0:
                         self.statusBar().showMessage("No changes to commit.", 2000)
-                except Exception:
-                    pass
+                        self.debug("Commit: no changes (file-specific)")
+                    else:
+                        rc_c, _, err_c = _git(self.catalog_root, "commit", "-m", msg, "--", str(self.current_path))
+                        if rc_c == -999:
+                            self._handle_git_timeout("Commit")
+                        elif rc_c == 0:
+                            rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
+                            if rc_sha == 0 and sha:
+                                self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
+                            self._schedule_git_push()
+                        else:
+                            self.statusBar().showMessage(f"Commit failed: {err_c or 'unknown error'}", 5000)
+                            self.debug(f"Commit: fail → {err_c or 'unknown error'}")
+                except Exception as ex:
+                    self.debug(f"Commit: exception → {ex!r}")
             else:
                 if bool(self.settings.get("git_enabled", True)) and not allow_commit_push:
                     self.debug("Commit: skipped due to pre-save pull failure/conflict")
@@ -2799,29 +2883,31 @@ class CatalogWindow(QMainWindow):
             except Exception as e:
                 self.error("Error", f"Failed to save folder metadata:\n{e}")
                 return
-            # Commit and schedule push (folder metadata JSON only)
-            try:
-                meta_p = folder_meta_path(self.current_folder)
-                msg = f"Folder '{self.current_folder.name}' metadata updated"
 
-                _git(self.catalog_root, "add", str(meta_p))
-                rc_chk, _, _ = _git(self.catalog_root, "diff", "--cached", "--quiet", "--", str(meta_p))
-                if rc_chk == 0:
-                    self.statusBar().showMessage("No changes to commit.", 2000)
-                    self.debug("Commit: no changes (folder meta)")
-                else:
-                    self.debug(f"Commit (folder meta): {meta_p.name} → {msg}")
-                    rc_c, _, err_c = _git(self.catalog_root, "commit", "-m", msg, "--", str(meta_p))
-                    if rc_c == 0:
-                        rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
-                        if rc_sha == 0 and sha:
-                            self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
-                        self._schedule_git_push()
+            # Commit and schedule push (folder metadata JSON only)
+            if allow_commit_push and bool(self.settings.get("git_enabled", True)):
+                try:
+                    msg = f"Folder '{self.current_folder.name}' metadata updated"
+                    _git(self.catalog_root, "add", str(meta_p))
+                    rc_chk, _, _ = _git(self.catalog_root, "diff", "--cached", "--quiet", "--", str(meta_p))
+                    if rc_chk == 0:
+                        self.statusBar().showMessage("No changes to commit.", 2000)
+                        self.debug("Commit: no changes (folder meta)")
                     else:
-                        self.statusBar().showMessage(f"Commit failed: {err_c or 'unknown error'}", 5000)
-                        self.debug(f"Commit: fail → {err_c or 'unknown error'}")
-            except Exception as ex:
-                self.debug(f"Commit: exception → {ex!r}")
+                        self.debug(f"Commit (folder meta): {meta_p.name} → {msg}")
+                        rc_c, _, err_c = _git(self.catalog_root, "commit", "-m", msg, "--", str(meta_p))
+                        if rc_c == -999:
+                            self._handle_git_timeout("Commit")
+                        elif rc_c == 0:
+                            rc_sha, sha, _ = _git(self.catalog_root, "rev-parse", "--short", "HEAD")
+                            if rc_sha == 0 and sha:
+                                self.statusBar().showMessage(f"Committed {sha}: {msg}", 3000)
+                            self._schedule_git_push()
+                        else:
+                            self.statusBar().showMessage(f"Commit failed: {err_c or 'unknown error'}", 5000)
+                            self.debug(f"Commit: fail → {err_c or 'unknown error'}")
+                except Exception as ex:
+                    self.debug(f"Commit: exception → {ex!r}")
             else:
                 if bool(self.settings.get("git_enabled", True)) and not allow_commit_push:
                     self.debug("Commit: skipped due to pre-save pull failure/conflict")
@@ -3049,10 +3135,11 @@ class CatalogWindow(QMainWindow):
         self.update_file_counter()
 
     def _schedule_git_push(self):
-        if not self.settings.get("git_enabled", True):
+        mode = git_mode_from_settings(self.settings)
+        if mode != GitMode.FULL:
             self.git_push_remaining_s = None
             self.push_label.setText("Sync push in: —")
-            self.debug("Push: skipped (git disabled)")
+            self.debug(f"Push: skipped (git mode={mode.name})")
             return
 
         try:
@@ -3078,9 +3165,9 @@ class CatalogWindow(QMainWindow):
         Returns True if it's safe to proceed with commit/push, False if we should skip commit.
         Never raises; logs to the debug console and status bar instead.
         """
-        # Respect the setting (default True if not present)
-        if not bool(self.settings.get("git_enabled", True)):
-            self.debug("Pull: skipped (git disabled)")
+        mode = git_mode_from_settings(self.settings)
+        if mode != GitMode.FULL:
+            self.debug(f"Pull: skipped (git mode={mode.name})")
             return True
 
         # Require an 'origin' remote; if not present, just proceed locally
@@ -3229,6 +3316,290 @@ class CatalogWindow(QMainWindow):
             self.tree.blockSignals(False)
             self.tree.setUpdatesEnabled(True)
 
+    def refresh_git_mode_label(self):
+        """Update the little 'Git: …' chip based on current settings."""
+        try:
+            # Legacy flag still respected: if disabled, show Off regardless of mode
+            if not self.settings.get("git_enabled", True):
+                self.git_mode_label.setText("Git: Off")
+                return
+
+            mode = git_mode_from_settings(self.settings)
+            # Be tolerant if something wrote a raw int
+            if isinstance(mode, int):
+                try:
+                    mode = GitMode(int(mode))
+                except Exception:
+                    mode = GitMode.FULL  # safe default
+
+            text_map = {
+                GitMode.OFF:        "Git: Off",
+                GitMode.LOCAL_ONLY: "Git: Local-Only",
+                GitMode.FULL:       "Git: Full",
+            }
+            self.git_mode_label.setText(text_map.get(mode, "Git: Full"))
+        except Exception:
+            # Never crash the UI because of the label
+            self.git_mode_label.setText("Git: Full")
+
+    def _current_branch(self) -> str:
+        br = (self.settings.get("git_branch") or "main").strip() or "main"
+        return br
+
+    def _ahead_behind_dirty(self) -> tuple[int, int, bool]:
+        """
+        Return (behind_cnt, ahead_cnt, dirty_worktree).
+        Uses 'origin/<branch>' if present. If no origin, ahead/behind are 0.
+        """
+        # Is repo?
+        rc, remotes, _ = _git(self.catalog_root, "remote")
+        has_origin = (rc == 0 and "origin" in (remotes or "").splitlines())
+        branch = self._current_branch()
+
+        # dirty?
+        rc_s, out_s, _ = _git(self.catalog_root, "status", "--porcelain")
+        dirty = (rc_s == 0 and bool(out_s.strip()))
+
+        behind = ahead = 0
+        if has_origin:
+            # Try to fetch if we're in FULL mode (keeps numbers fresh)
+            mode = git_mode_from_settings(self.settings)
+            if mode == GitMode.FULL:
+                _git(self.catalog_root, "fetch", "origin", branch)
+            rc_ab, out_ab, _ = _git(self.catalog_root, "rev-list", "--left-right", "--count", f"origin/{branch}...HEAD")
+            if rc_ab == 0 and out_ab.strip():
+                # Output like: "X\tY" or "X Y"
+                parts = out_ab.replace("\t", " ").split()
+                if len(parts) >= 2:
+                    try:
+                        behind, ahead = int(parts[0]), int(parts[1])
+                    except Exception:
+                        behind = ahead = 0
+        return behind, ahead, dirty
+    
+    def _sync_state_text(self) -> str:
+        mode = git_mode_from_settings(self.settings)
+        if not self.settings.get("git_enabled", True):
+            return "Synchronized"  # Treat as inert when git is off
+        behind, ahead, dirty = self._ahead_behind_dirty()
+        if behind == 0 and ahead == 0 and not dirty:
+            return "Synchronized"
+        if behind > 0 and (ahead > 0 or dirty):
+            return "Out of Sync (complex)"
+        if behind > 0 and ahead == 0 and not dirty:
+            return "Out of Sync (behind)"
+        # local changes or ahead only
+        return "Out of Sync (ahead)"
+
+    def _path_last_commit_ts(self, rev: str, relpath: str) -> int | None:
+        rc, out, _ = _git(self.catalog_root, "log", "-1", "--format=%ct", rev, "--", relpath)
+        try:
+            return int(out.strip()) if (rc == 0 and out.strip()) else None
+        except Exception:
+            return None
+
+    def _path_fs_mtime_ts(self, abspath: Path) -> int | None:
+        try:
+            return int(abspath.stat().st_mtime)
+        except Exception:
+            return None
+
+    def _remote_has_path(self, rev: str, relpath: str) -> bool:
+        rc, out, _ = _git(self.catalog_root, "ls-tree", "-r", "--name-only", rev, "--", relpath)
+        return (rc == 0 and out.strip() == relpath)
+
+    def sync_repo(self):
+        """
+        User-initiated sync:
+        - FULL mode: per-file newest-wins (fetch, decide per path, commit, push, pull --rebase).
+        - LOCAL_ONLY or OFF (or git_enabled=False): local-only consolidate; stage and commit working tree.
+        Always runs in background and updates footer when done.
+        """
+        # Ensure a repo exists so local commits can work even if git was off at startup.
+        try:
+            ensure_git_repo(self.catalog_root, self.settings)
+        except Exception:
+            pass
+
+        mode = git_mode_from_settings(self.settings)
+        if mode == GitMode.FULL and self.settings.get("git_enabled", True):
+            self._gitbg.submit(self._bg_sync_repo_full)
+        else:
+            self._gitbg.submit(self._bg_sync_repo_local_only)
+
+
+    # ---------------- INTERNALS ----------------
+
+    def _bg_sync_repo_local_only(self):
+        """Local-only consolidate: stage working tree changes and commit once. No network."""
+        try:
+            self.debug("Sync (local-only): start")
+            self._gitbg.ui(lambda: self.statusBar().showMessage("Local sync in progress…", 2000))
+
+            # Stage deletions/renames/modified/untracked
+            _git(self.catalog_root, "add", "-A")
+
+            # If anything is staged, commit
+            rc_diff, _, _ = _git(self.catalog_root, "diff", "--cached", "--quiet")
+            if rc_diff != 0:
+                msg = "Sync (local-only): consolidate working tree"
+                rc_c, _, err_c = _git(self.catalog_root, "commit", "-m", msg)
+                if rc_c == -999:
+                    self._handle_git_timeout("Commit")  # flips to Local-Only label, harmless here
+                elif rc_c != 0:
+                    self.debug(f"Sync (local-only): commit failed → {err_c or 'unknown error'}")
+                    self._gitbg.ui(lambda: self.statusBar().showMessage("Local sync commit failed.", 5000))
+                    self._gitbg.ui(self.update_file_counter)
+                    return
+
+            self._gitbg.ui(lambda: self.statusBar().showMessage("Local sync complete.", 2500))
+            self._gitbg.ui(self.update_file_counter)
+            self.debug("Sync (local-only): done")
+        except Exception as ex:
+            self.debug(f"Sync (local-only): exception → {ex!r}")
+            self._gitbg.ui(lambda: self.statusBar().showMessage("Local sync failed (exception).", 5000))
+
+
+    def _bg_sync_repo_full(self):
+        """Full newest-wins sync vs origin/<branch>, then push and pull --rebase."""
+        try:
+            branch = self._current_branch()
+            self.debug(f"Sync (full): start (branch={branch})")
+            self._gitbg.ui(lambda: self.statusBar().showMessage("Sync in progress…", 2000))
+
+            # 1) Fetch latest
+            rc_f, _, _ = _git(self.catalog_root, "fetch", "origin", branch)
+            if rc_f == -999:
+                self._handle_git_timeout("Fetch")
+                # Fall back to local-only consolidation
+                self._bg_sync_repo_local_only()
+                return
+
+            # 2) Compute changed path sets (remote-only, local-only, working tree)
+            rc_b, out_b, _ = _git(self.catalog_root, "diff", "--name-only", f"HEAD..origin/{branch}")
+            rc_a, out_a, _ = _git(self.catalog_root, "diff", "--name-only", f"origin/{branch}..HEAD")
+            remote_changed = set([p for p in (out_b or "").splitlines() if p.strip()])
+            local_changed  = set([p for p in (out_a or "").splitlines() if p.strip()])
+
+            rc_s, out_s, _ = _git(self.catalog_root, "status", "--porcelain")
+            wt_paths = set()
+            if rc_s == 0 and out_s:
+                for line in out_s.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if " -> " in line:
+                        path = line.split(" -> ", 1)[1].strip()
+                    else:
+                        path = line[3:].strip() if len(line) > 3 else line.strip()
+                    if path:
+                        wt_paths.add(path)
+
+            all_paths = sorted(set().union(remote_changed, local_changed, wt_paths))
+
+            took_remote, kept_local, removed_local, staged_new = [], [], [], []
+
+            for rel in all_paths:
+                abs_p = (self.catalog_root / rel)
+
+                local_ts = self._path_fs_mtime_ts(abs_p) if rel in wt_paths or rel in local_changed else self._path_last_commit_ts("HEAD", rel)
+                remote_ts = self._path_last_commit_ts(f"origin/{branch}", rel)
+
+                remote_has = self._remote_has_path(f"origin/{branch}", rel)
+                local_exists = abs_p.exists()
+
+                # Remote deleted this path?
+                if not remote_has and local_exists:
+                    if remote_ts is not None and (local_ts is None or remote_ts > (local_ts or 0)):
+                        _git(self.catalog_root, "rm", "--quiet", "--force", "--", rel)
+                        removed_local.append(rel)
+                    else:
+                        _git(self.catalog_root, "add", "--", rel)
+                        staged_new.append(rel)
+                    continue
+
+                # Only remote has
+                if remote_has and not local_exists:
+                    _git(self.catalog_root, "checkout", f"origin/{branch}", "--", rel)
+                    _git(self.catalog_root, "add", "--", rel)
+                    took_remote.append(rel)
+                    continue
+
+                # Both sides have: pick freshest
+                lts = local_ts or 0
+                rts = remote_ts or 0
+                if rts > lts:
+                    _git(self.catalog_root, "checkout", f"origin/{branch}", "--", rel)
+                    _git(self.catalog_root, "add", "--", rel)
+                    took_remote.append(rel)
+                else:
+                    if local_exists:
+                        _git(self.catalog_root, "add", "--", rel)
+                    kept_local.append(rel)
+
+            # 3) Commit if staged
+            rc_diff, _, _ = _git(self.catalog_root, "diff", "--cached", "--quiet")
+            if rc_diff != 0:
+                msg = "Sync: per-file freshest merge"
+                rc_c, _, err_c = _git(self.catalog_root, "commit", "-m", msg)
+                if rc_c == -999:
+                    self._handle_git_timeout("Commit")
+                    # Fall back to local-only (still useful)
+                    self._bg_sync_repo_local_only()
+                    return
+                if rc_c != 0:
+                    self.debug(f"Sync: commit failed → {err_c or 'unknown error'}")
+                    self._gitbg.ui(lambda: self.statusBar().showMessage("Sync commit failed.", 5000))
+                    self._gitbg.ui(self.update_file_counter)
+                    return
+
+            # 4) Push, then pull --rebase to ensure final alignment
+            rc_p, _, err_p = _git(self.catalog_root, "push", "origin", f"HEAD:{branch}")
+            if rc_p == -999:
+                self._handle_git_timeout("Push")
+                # local-only fallback is already committed; just stop here
+                self._gitbg.ui(self.update_file_counter)
+                return
+            if rc_p != 0:
+                self.debug(f"Sync: push failed → {err_p or 'unknown error'}")
+                self._gitbg.ui(lambda: self.statusBar().showMessage("Sync push failed.", 5000))
+            else:
+                _git(self.catalog_root, "pull", "--rebase", "--autostash", "origin", branch)
+                self._gitbg.ui(lambda: self.statusBar().showMessage("Sync complete.", 3000))
+
+            self._gitbg.ui(self.update_file_counter)
+            if took_remote or kept_local or removed_local or staged_new:
+                self.debug(
+                    "Sync summary →"
+                    f" took_remote={len(took_remote)}, kept_local={len(kept_local)}, "
+                    f"removed_local={len(removed_local)}, staged_new={len(staged_new)}"
+                )
+            self.debug("Sync (full): done")
+        except Exception as ex:
+            self.debug(f"Sync (full): exception → {ex!r}")
+            self._gitbg.ui(lambda: self.statusBar().showMessage("Sync failed (exception).", 5000))
+            self._gitbg.ui(self.update_file_counter)
+
+    def _current_branch(self) -> str:
+        br = (self.settings.get("git_branch") or "main").strip() or "main"
+        return br
+
+    def _path_last_commit_ts(self, rev: str, relpath: str) -> int | None:
+        rc, out, _ = _git(self.catalog_root, "log", "-1", "--format=%ct", rev, "--", relpath)
+        try:
+            return int(out.strip()) if (rc == 0 and out.strip()) else None
+        except Exception:
+            return None
+
+    def _path_fs_mtime_ts(self, abspath: Path) -> int | None:
+        try:
+            return int(abspath.stat().st_mtime)
+        except Exception:
+            return None
+
+    def _remote_has_path(self, rev: str, relpath: str) -> bool:
+        rc, out, _ = _git(self.catalog_root, "ls-tree", "-r", "--name-only", rev, "--", relpath)
+        return (rc == 0 and out.strip() == relpath)
 
 # ---------- Boot ---------------------------------------------------------------
 def ensure_catalog_root(start_dir: Path | None = None) -> Path:
