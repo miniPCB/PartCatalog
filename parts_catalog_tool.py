@@ -1427,6 +1427,12 @@ class CatalogWindow(QMainWindow):
         self.countdown_timer.timeout.connect(self._tick_autosave_countdown)
         self.countdown_timer.start(1000)
 
+        # --- Footer sync poller (every 60s) ---
+        self._sync_poll_timer = QTimer(self)
+        self._sync_poll_timer.setInterval(60_000)  # 60s
+        self._sync_poll_timer.timeout.connect(self._poll_remote_sync_status)
+        self._sync_poll_timer.start()
+
         self._wire_dirty_signals()
         self.apply_monospace_font()
 
@@ -2745,6 +2751,7 @@ class CatalogWindow(QMainWindow):
                 self._clear_dirty()
                 self._reset_autosave_countdown()
                 self._update_stats_on_save(self.current_path, raw)
+                self.update_file_counter()
 
                 # Commit and schedule push (if allowed)
                 if allow_commit_push and bool(self.settings.get("git_enabled", True)):
@@ -2823,6 +2830,7 @@ class CatalogWindow(QMainWindow):
             self._reset_autosave_countdown()
             self.proxy.refresh_desc(self.current_path)
             self._update_stats_on_save(self.current_path, text)
+            self.update_file_counter()
 
             # Commit and schedule push (if allowed)
             if allow_commit_push and bool(self.settings.get("git_enabled", True)):
@@ -2917,6 +2925,7 @@ class CatalogWindow(QMainWindow):
             self.folder_updated.setText(meta["Last Updated"])
             self._clear_dirty()
             self._reset_autosave_countdown()
+            self.update_file_counter()
             if not silent:
                 self.info("Saved", "Folder metadata saved.")
             return
@@ -3600,6 +3609,34 @@ class CatalogWindow(QMainWindow):
     def _remote_has_path(self, rev: str, relpath: str) -> bool:
         rc, out, _ = _git(self.catalog_root, "ls-tree", "-r", "--name-only", rev, "--", relpath)
         return (rc == 0 and out.strip() == relpath)
+
+    def _poll_remote_sync_status(self):
+        """
+        Refresh footer status every 60s.
+        - In Git: Full → do a quick background fetch (keeps ahead/behind fresh), then update footer.
+        - In Local-Only / Off or git disabled → just refresh footer from local state.
+        Never blocks the UI.
+        """
+        if not self.settings.get("git_enabled", True):
+            # Git disabled → show whatever local says
+            self.update_file_counter()
+            return
+
+        mode = git_mode_from_settings(self.settings)
+        if mode == GitMode.FULL:
+            def _bg_fetch_then_refresh():
+                try:
+                    branch = (self.settings.get("git_branch") or "main").strip() or "main"
+                    _git(self.catalog_root, "fetch", "origin", branch)
+                except Exception:
+                    pass
+                finally:
+                    # Update the footer on the UI thread
+                    self._gitbg.ui(self.update_file_counter)
+            self._gitbg.submit(_bg_fetch_then_refresh)
+        else:
+            # Local-Only or Off → no network, but still refresh label (dirty/ahead local)
+            self.update_file_counter()
 
 # ---------- Boot ---------------------------------------------------------------
 def ensure_catalog_root(start_dir: Path | None = None) -> Path:
