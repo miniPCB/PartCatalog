@@ -2207,6 +2207,19 @@ class CatalogWindow(QMainWindow):
 
         state_txt = self._sync_state_text()  # "Synchronized", "Out of Sync (ahead/behind/complex)"
         self.counter_label.setText(f"Files in folder: {in_folder} | Total: {root_total}; {state_txt}")
+        try:
+            behind, ahead, dirty = self._ahead_behind_dirty()
+            # build the same text you show to the user:
+            base = self.counter_label.text().split(";")[0]  # "Files in folder: # | Total: #"
+            if behind and (ahead or dirty):  state = "Out of Sync (complex)"
+            elif behind:                     state = "Out of Sync (behind)"
+            elif ahead or dirty:             state = "Out of Sync (ahead)"
+            else:                            state = "Synchronized"
+            # show + log
+            self.counter_label.setText(f"{base}; {state}")
+            self._dbg_sync_line("footer", ahead=ahead, behind=behind, dirty=dirty, extra=f"→ {state}")
+        except Exception as ex:
+            self.debug(f"footer:update exception → {ex!r}")
 
         # ---------- UI / selection helpers -----------------------------------------
     def show_file_ui(self, file_selected: bool):
@@ -3353,33 +3366,47 @@ class CatalogWindow(QMainWindow):
 
     def _ahead_behind_dirty(self) -> tuple[int, int, bool]:
         """
-        Return (behind_cnt, ahead_cnt, dirty_worktree).
-        Uses 'origin/<branch>' if present. If no origin, ahead/behind are 0.
+        Return (behind_cnt, ahead_cnt, dirty_worktree), with helpful debug:
+        - prefers upstream @{u}; otherwise origin/<branch> if present
+        - only fetches in FULL mode (so 'behind' is fresh there)
         """
-        # Is repo?
-        rc, remotes, _ = _git(self.catalog_root, "remote")
-        has_origin = (rc == 0 and "origin" in (remotes or "").splitlines())
-        branch = self._current_branch()
+        # Dirty?
+        rc_s, out_s, err_s = _git(self.catalog_root, "status", "--porcelain")
+        dirty = (rc_s == 0 and bool((out_s or "").strip()))
+        mode = git_mode_from_settings(self.settings)
 
-        # dirty?
-        rc_s, out_s, _ = _git(self.catalog_root, "status", "--porcelain")
-        dirty = (rc_s == 0 and bool(out_s.strip()))
+        # Upstream?
+        rc_u, _, _ = _git(self.catalog_root, "rev-parse", "--symbolic-full-name", "--abbrev-ref", "@{u}")
+        has_upstream = (rc_u == 0)
 
-        behind = ahead = 0
-        if has_origin:
-            # Try to fetch if we're in FULL mode (keeps numbers fresh)
-            mode = git_mode_from_settings(self.settings)
-            if mode == GitMode.FULL:
-                _git(self.catalog_root, "fetch", "origin", branch)
-            rc_ab, out_ab, _ = _git(self.catalog_root, "rev-list", "--left-right", "--count", f"origin/{branch}...HEAD")
-            if rc_ab == 0 and out_ab.strip():
-                # Output like: "X\tY" or "X Y"
-                parts = out_ab.replace("\t", " ").split()
-                if len(parts) >= 2:
-                    try:
-                        behind, ahead = int(parts[0]), int(parts[1])
-                    except Exception:
-                        behind = ahead = 0
+        # Fetch only if FULL
+        remote_ref = ""
+        if mode == GitMode.FULL:
+            br = self._current_branch()
+            self._dbg_sync_line("ahead_behind:fetch", extra=f"mode={mode.name}, branch={br}")
+            _git(self.catalog_root, "fetch", "origin", br)
+            remote_ref = "@{u}" if has_upstream else f"origin/{br}"
+        else:
+            br = self._current_branch()
+            remote_ref = "@{u}" if has_upstream else (f"origin/{br}" if self._has_origin() else "")
+            self._dbg_sync_line("ahead_behind:nofetch", extra=f"mode={mode.name}, remote_ref={remote_ref or 'none'}")
+
+        if not remote_ref:
+            self._dbg_sync_line("ahead_behind:local_only", dirty=dirty, extra="no remote/upstream")
+            return (0, 0, dirty)
+
+        rc_ab, out_ab, err_ab = _git(self.catalog_root, "rev-list", "--left-right", "--count", f"{remote_ref}...HEAD")
+        if rc_ab != 0 or not (out_ab or "").strip():
+            self._dbg_sync_line("ahead_behind:error", dirty=dirty, extra=f"rc={rc_ab} err={err_ab or '—'}")
+            return (0, 0, dirty)
+
+        try:
+            left, right = out_ab.replace("\t", " ").split()[:2]
+            behind, ahead = int(left), int(right)
+        except Exception:
+            behind = ahead = 0
+
+        self._dbg_sync_line("ahead_behind:result", ahead=ahead, behind=behind, dirty=dirty, extra=f"mode={mode.name} ref={remote_ref}")
         return behind, ahead, dirty
     
     def _sync_state_text(self) -> str:
@@ -3414,20 +3441,64 @@ class CatalogWindow(QMainWindow):
         return (rc == 0 and out.strip() == relpath)
 
     def sync_repo(self):
-        # Ensure repo exists for local commits regardless of mode
+        """
+        Always sync:
+        - FULL + git_enabled: per-file newest-wins vs remote (fetch/commit/push/pull).
+        - Otherwise: local-only consolidate (stage everything and commit if needed).
+        """
         try:
             ensure_git_repo(self.catalog_root, self.settings)
         except Exception:
             pass
 
         mode = git_mode_from_settings(self.settings)
+        self.debug(f"Sync button: pressed (mode={mode.name}, git_enabled={bool(self.settings.get('git_enabled', True))})")
         if mode == GitMode.FULL and self.settings.get("git_enabled", True):
             self._gitbg.submit(self._bg_sync_repo_full)
         else:
-            if mode != GitMode.FULL or not self.settings.get("git_enabled", True):
-                self._gitbg.ui(lambda: self.statusBar().showMessage(
-                    "Network sync disabled (Git not Full). Doing local consolidate…", 4000))
+            # Still do a useful local sync so the button “works” in Off/Local-Only
+            self._gitbg.ui(lambda: self.statusBar().showMessage(
+                "Network sync disabled (Git not Full). Consolidating locally…", 4000))
             self._gitbg.submit(self._bg_sync_repo_local_only)
+
+    def _ahead_behind_dirty(self) -> tuple[int, int, bool]:
+        """
+        Return (behind_cnt, ahead_cnt, dirty_worktree).
+        Uses upstream @{u} when available; otherwise falls back to origin/<branch>.
+        We only fetch in FULL mode; ahead still increments without a fetch.
+        """
+        # Worktree dirty?
+        rc_s, out_s, _ = _git(self.catalog_root, "status", "--porcelain")
+        dirty = (rc_s == 0 and bool((out_s or "").strip()))
+
+        behind = ahead = 0
+
+        # Prefer upstream (@{u}) when set
+        rc_u, _, _ = _git(self.catalog_root, "rev-parse", "--symbolic-full-name", "--abbrev-ref", "@{u}")
+        has_upstream = (rc_u == 0)
+
+        # Fetch only if FULL (keeps behind fresh), but not required for "ahead"
+        mode = git_mode_from_settings(self.settings)
+        if mode == GitMode.FULL:
+            branch = self._current_branch()
+            _git(self.catalog_root, "fetch", "origin", branch)
+
+        if has_upstream:
+            rc_ab, out_ab, _ = _git(self.catalog_root, "rev-list", "--left-right", "--count", "@{u}...HEAD")
+        elif self._has_origin():
+            branch = self._current_branch()
+            rc_ab, out_ab, _ = _git(self.catalog_root, "rev-list", "--left-right", "--count", f"origin/{branch}...HEAD")
+        else:
+            return (0, 0, dirty)
+
+        if rc_ab == 0 and (out_ab or "").strip():
+            parts = out_ab.replace("\t", " ").split()
+            if len(parts) >= 2:
+                try:
+                    behind, ahead = int(parts[0]), int(parts[1])
+                except Exception:
+                    pass
+        return behind, ahead, dirty
 
     # ---------------- INTERNALS ----------------
 
@@ -3441,7 +3512,9 @@ class CatalogWindow(QMainWindow):
             _git(self.catalog_root, "add", "-A")
 
             # If anything is staged, commit
+            self.debug("Sync(local): add -A")
             rc_diff, _, _ = _git(self.catalog_root, "diff", "--cached", "--quiet")
+            self.debug(f"Sync(local): staged? {'yes' if rc_diff!=0 else 'no'}")
             if rc_diff != 0:
                 msg = "Sync (local-only): consolidate working tree"
                 rc_c, _, err_c = _git(self.catalog_root, "commit", "-m", msg)
@@ -3474,6 +3547,10 @@ class CatalogWindow(QMainWindow):
                 # Fall back to local-only consolidation
                 self._bg_sync_repo_local_only()
                 return
+
+            self.debug(f"Sync(full): fetched origin/{branch}")
+            b0, a0, d0 = self._ahead_behind_dirty()
+            self._dbg_sync_line("Sync(full):pre", ahead=a0, behind=b0, dirty=d0)
 
             # 2) Compute changed path sets (remote-only, local-only, working tree)
             rc_b, out_b, _ = _git(self.catalog_root, "diff", "--name-only", f"HEAD..origin/{branch}")
@@ -3539,6 +3616,7 @@ class CatalogWindow(QMainWindow):
 
             # 3) Commit if staged
             rc_diff, _, _ = _git(self.catalog_root, "diff", "--cached", "--quiet")
+            self.debug(f"Sync(full): staged? {'yes' if rc_diff != 0 else 'no'}")
             if rc_diff != 0:
                 msg = "Sync: per-file freshest merge"
                 rc_c, _, err_c = _git(self.catalog_root, "commit", "-m", msg)
@@ -3552,6 +3630,8 @@ class CatalogWindow(QMainWindow):
                     self._gitbg.ui(lambda: self.statusBar().showMessage("Sync commit failed.", 5000))
                     self._gitbg.ui(self.update_file_counter)
                     return
+                else:
+                    self.debug("Sync: commit ok")
 
             # 4) Decide whether to push even if no new commit happened
             if not self._has_origin():
@@ -3559,16 +3639,15 @@ class CatalogWindow(QMainWindow):
                 self._gitbg.ui(self.update_file_counter)
                 return
 
-            # Refresh ahead/behind quickly (fetch already done above)
+            # Refresh ahead/behind (fetch already done)
             behind, ahead, dirty = self._ahead_behind_dirty()
+            self._dbg_sync_line("Sync(full):decide", ahead=ahead, behind=behind, dirty=dirty)
 
-            # If we're ahead, push (even when no new commit was created in step 3)
+            # If we're ahead, push (even if nothing new was committed this run)
             if ahead > 0:
-                # First push may need -u to set upstream
                 push_args = ["push", "origin", f"HEAD:{branch}"]
                 if not self._has_upstream():
                     push_args = ["push", "-u", "origin", f"HEAD:{branch}"]
-
                 rc_p, _, err_p = _git(self.catalog_root, *push_args)
                 if rc_p == -999:
                     self._handle_git_timeout("Push")
@@ -3579,10 +3658,18 @@ class CatalogWindow(QMainWindow):
                     self._gitbg.ui(lambda: self.statusBar().showMessage("Sync push failed.", 5000))
                     self._gitbg.ui(self.update_file_counter)
                     return
+                self.debug("Sync: push ok")
 
-                # Pull (fast-forward/rebase) to ensure full alignment after push
-                _git(self.catalog_root, "pull", "--rebase", "--autostash", "origin", branch)
+                # Pull (fast-forward/rebase) to ensure final alignment after push
+                rc_pull, _, err_pull = _git(self.catalog_root, "pull", "--rebase", "--autostash", "origin", branch)
+                if rc_pull == -999:
+                    self._handle_git_timeout("Pull")
+                elif rc_pull != 0:
+                    self.debug(f"Sync: pull after push failed → {err_pull or 'unknown error'}")
+                else:
+                    self.debug("Sync: pull after push ok")
                 self._gitbg.ui(lambda: self.statusBar().showMessage("Sync complete.", 3000))
+
             else:
                 # Not ahead: we might still be behind
                 if behind > 0:
@@ -3593,6 +3680,7 @@ class CatalogWindow(QMainWindow):
                         self.debug(f"Sync: pull failed → {err_pull or 'unknown error'}")
                         self._gitbg.ui(lambda: self.statusBar().showMessage("Sync pull failed.", 5000))
                     else:
+                        self.debug("Sync: pull ok")
                         self._gitbg.ui(lambda: self.statusBar().showMessage("Sync complete.", 3000))
                 else:
                     self._gitbg.ui(lambda: self.statusBar().showMessage("Already synchronized.", 2000))
@@ -3605,6 +3693,8 @@ class CatalogWindow(QMainWindow):
                     f" took_remote={len(took_remote)}, kept_local={len(kept_local)}, "
                     f"removed_local={len(removed_local)}, staged_new={len(staged_new)}"
                 )
+            b1, a1, d1 = self._ahead_behind_dirty()
+            self._dbg_sync_line("Sync(full):post", ahead=a1, behind=b1, dirty=d1)
             self.debug("Sync (full): done")
 
         except Exception as ex:
@@ -3671,6 +3761,20 @@ class CatalogWindow(QMainWindow):
         else:
             # Local-Only or Off → no network, but still refresh label (dirty/ahead local)
             self.update_file_counter()
+
+    def _mode_name(self) -> str:
+        try:
+            return git_mode_from_settings(self.settings).name
+        except Exception:
+            return "UNKNOWN"
+
+    def _dbg_sync_line(self, where: str, *, ahead: int|None=None, behind: int|None=None, dirty: bool|None=None, extra: str=""):
+        parts = [f"{where}"]
+        if ahead is not None:  parts.append(f"ahead={ahead}")
+        if behind is not None: parts.append(f"behind={behind}")
+        if dirty is not None:  parts.append(f"dirty={dirty}")
+        if extra: parts.append(extra)
+        self.debug(" | ".join(parts))
 
 # ---------- Boot ---------------------------------------------------------------
 def ensure_catalog_root(start_dir: Path | None = None) -> Path:

@@ -8,14 +8,14 @@
   },
   "stats": {
     "files_total": 17,
-    "lines_total": 6630,
+    "lines_total": 6707,
     "last_saved_path": "C:\\Repos\\PartCatalog\\catalog\\partcatalog\\002\\NM003.md",
-    "last_updated": "2025-10-07T19:58:52"
+    "last_updated": "2025-10-08T19:37:26"
   },
   "git_remote_url": "git@github.com:miniPCB/PartCatalog.git",
   "git_branch": "main",
   "auto_push_delay_seconds": 5,
   "show_debug_console": true,
-  "git_enabled": true,
-  "git_mode": 2
+  "git_enabled": false,
+  "git_mode": 0
 }
