@@ -16,6 +16,6 @@
   "git_branch": "main",
   "auto_push_delay_seconds": 5,
   "show_debug_console": true,
-  "git_enabled": false,
-  "git_mode": 0
+  "git_enabled": true,
+  "git_mode": 2
 }
